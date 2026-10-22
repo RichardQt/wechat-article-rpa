@@ -63,6 +63,21 @@ class WritableFakeTargetCollection(FakeTargetCollection):
 
         return Result()
 
+    def delete_one(self, query: dict):
+        for index, document in enumerate(self.documents):
+            if document.get("_id") == query.get("_id"):
+                self.documents.pop(index)
+
+                class Result:
+                    deleted_count = 1
+
+                return Result()
+
+        class Missing:
+            deleted_count = 0
+
+        return Missing()
+
 
 class AccountManagementTests(unittest.TestCase):
     def test_account_list_combines_target_and_article_coverage(self) -> None:
@@ -154,6 +169,51 @@ class AccountManagementTests(unittest.TestCase):
         self.assertEqual(target.documents[0]["category"], "AI")
         self.assertNotIn("search_name", target.documents[0])
         self.assertEqual(aliases, {"量子位": "量子位公众号"})
+
+    def test_delete_removes_target_and_alias_without_touching_articles(self) -> None:
+        class CountingArticles(FakeArticleCollection):
+            def count_documents(self, match: dict) -> int:
+                self.match = match
+                return 17
+
+            def delete_one(self, *_args, **_kwargs):
+                raise AssertionError("不能删除已入库文章")
+
+            def delete_many(self, *_args, **_kwargs):
+                raise AssertionError("不能删除已入库文章")
+
+        target = WritableFakeTargetCollection(
+            [
+                {"_id": "target-1", "name": "南京发布", "id": "njfb", "category": "政务", "type": "公众号"},
+                {"_id": "target-2", "name": "量子位"},
+            ]
+        )
+        articles = CountingArticles()
+        aliases = {"南京发布": "南京发布官微", "量子位": "量子位公众号"}
+
+        result = panel.delete_account_config(
+            "target-1",
+            target_collection=target,
+            article_collection=articles,
+            aliases=aliases,
+            persist_aliases=False,
+        )
+
+        self.assertEqual(result["name"], "南京发布")
+        self.assertEqual(result["articles_kept"], 17)
+        self.assertEqual(articles.match, {"account.name": "南京发布"})
+        self.assertEqual([item["name"] for item in target.documents], ["量子位"])
+        self.assertEqual(aliases, {"量子位": "量子位公众号"})
+
+    def test_delete_rejects_unknown_record(self) -> None:
+        with self.assertRaises(ValueError):
+            panel.delete_account_config(
+                "missing",
+                target_collection=WritableFakeTargetCollection([]),
+                article_collection=FakeArticleCollection(),
+                aliases={},
+                persist_aliases=False,
+            )
 
 
 if __name__ == "__main__":

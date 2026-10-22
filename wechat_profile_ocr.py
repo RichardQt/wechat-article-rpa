@@ -586,9 +586,13 @@ class WeChatProfileOCR:
                 "right": merged["left"] + char_width * (account_index + 2),
             }
 
-        # 选中状态会在文字正下方显示一条较长的深色横线。
-        left = max(0, round(account["left"] - width * 0.02))
-        right = min(width, round(account["right"] + width * 0.02))
+        # 选中状态会在文字正下方显示一条与文字等宽的深色横线。
+        # 边距按文字宽度计算。按整个窗口宽度扩边时，宽窗口会把两侧空白算进分母，
+        # 已经选中的下划线占比会掉到 0.45 以下。
+        label_width = max(float(account["right"]) - float(account["left"]), 1.0)
+        horizontal_pad = max(2.0, label_width * 0.08)
+        left = max(0, round(float(account["left"]) - horizontal_pad))
+        right = min(width, round(float(account["right"]) + horizontal_pad))
         top = max(0, round(account["bottom"] + 2))
         bottom = min(height, round(account["bottom"] + height * 0.035))
         underline_crop = np.asarray(

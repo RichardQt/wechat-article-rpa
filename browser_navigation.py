@@ -98,6 +98,33 @@ def selected_tab(data: dict) -> tuple:
     return selected[0] if len(selected) == 1 else ()
 
 
+def profile_card_click_point(
+    title_rect: tuple,
+    anchor_bottom: float | None,
+    bounds: tuple[int, int, int, int],
+) -> tuple[tuple[int, int], str]:
+    """标题被窗口底边切开时，改点卡片中部。
+
+    带封面的卡片里，日期标签和标题之间就是封面，中心点落在封面上。
+    没有足够封面高度时，只把点击从底边抬进仍能看见的标题，不再点窗口边缘。
+    """
+    left, top, right, bottom = bounds
+    x1, y1, x2, y2 = title_rect
+    x = min(max((x1 + x2) / 2, left + 1), right - 1)
+    title_y = (y1 + y2) / 2
+    edge = bottom - 8
+    if y2 < edge:
+        return (round(x), round(title_y)), "title"
+    if anchor_bottom is not None and 80 <= (y1 - anchor_bottom) <= 520:
+        cover_top = max(float(anchor_bottom), top + 60)
+        cover_bottom = min(float(y1), edge)
+        if cover_bottom - cover_top >= 40:
+            return (round(x), round((cover_top + cover_bottom) / 2)), "card-center"
+    visible_top = max(float(y1), top + 60)
+    click_y = min(visible_top + 10, float(edge))
+    return (round(x), round(max(click_y, top + 60))), "card-center"
+
+
 def feed_from_probe(data: dict, rect: tuple[int, int, int, int], account: str = "") -> dict:
     """按文档顺序将日期、完整标题与阅读/点赞行关联，只点击视口内卡片。"""
     page = page_from_probe(data, account)
@@ -107,44 +134,97 @@ def feed_from_probe(data: dict, rect: tuple[int, int, int, int], account: str = 
     width, height = right - left, bottom - top
     articles, labels = [], []
     date = ""
+    date_bottom: float | None = None
     previous = None
     title_rows = []
+    pending_read: str | None = None
+    pending_like: str | None = None
     date_pattern = r"(?:置顶|今天|昨天|(?:星期|周)[一二三四五六日天]|(?:\d{4}年)?\d{1,2}月\d{1,2}日)"
+
+    def metric_number(value: str | None) -> int | None:
+        if not value:
+            return None
+        return round(float(value.rstrip("万+")) * (10000 if "万" in value else 1))
+
+    def reset_card() -> None:
+        nonlocal previous, title_rows, pending_read, pending_like
+        previous = None
+        title_rows = []
+        pending_read = None
+        pending_like = None
+
+    def emit_card(read_text: str | None, like_text: str | None) -> None:
+        if not previous or not date or not read_text:
+            return
+        x1, y1, x2, y2 = previous["rect"]
+        x, y = (x1 + x2) / 2, (y1 + y2) / 2
+        if previous.get("offscreen") or not (left < x < right and top + 50 < y < bottom):
+            return
+        cy = round((y - top) * 1000 / height)
+        labels.append({"text": date, "center_y_1000": cy - 1, "confidence": 1.0})
+        group = adjacent_title_lines(title_rows, title_rows[-1])
+        title_box = (
+            min(item["left"] for item in group),
+            min(item["top"] for item in group),
+            max(item["right"] for item in group),
+            max(item["bottom"] for item in group),
+        )
+        screen_point, click_target = profile_card_click_point(
+            title_box, date_bottom, (left, top, right, bottom)
+        )
+        display = [read_text] if like_text is None else [read_text, like_text]
+        articles.append({
+            "title": "".join(item["text"] for item in group),
+            "center_x_1000": round((x - left) * 1000 / width),
+            "center_y_1000": cy,
+            "screen_point": screen_point,
+            "click_target": click_target,
+            "time_group": date,
+            "list_read_count": metric_number(read_text),
+            "list_like_count": metric_number(like_text),
+            "list_metrics_display": display,
+            "confidence": 1.0,
+        })
+
     for doc in data["documents"]:
         if normalize(doc["name"]) != normalize(page.name):
             continue
         for row in doc["rows"]:
             text = normalize(row["text"])
             if re.fullmatch(date_pattern, text):
+                emit_card(pending_read, pending_like)
+                reset_card()
                 date = text
-                previous = None
-                title_rows = []
+                date_bottom = row["rect"][3]
                 continue
-            metric = re.fullmatch(r"阅读([\d.]+万?\+?)赞([\d.]+万?\+?)", text)
-            if metric:
-                if previous and date:
-                    x1, y1, x2, y2 = previous["rect"]
-                    x, y = (x1 + x2) / 2, (y1 + y2) / 2
-                    if not previous.get("offscreen") and left < x < right and top + 50 < y < bottom:
-                        cy = round((y - top) * 1000 / height)
-                        labels.append({"text": date, "center_y_1000": cy - 1, "confidence": 1.0})
-                        def number(value: str) -> int:
-                            return round(float(value.rstrip("万+")) * (10000 if "万" in value else 1))
-                        group = adjacent_title_lines(title_rows, title_rows[-1])
-                        articles.append({"title": "".join(r["text"] for r in group), "center_x_1000": round((x-left)*1000/width),
-                                         "center_y_1000": cy, "screen_point": (round(x), round(y)),
-                                         "time_group": date,
-                                         "list_read_count": number(metric[1]), "list_like_count": number(metric[2]),
-                                         "list_metrics_display": [metric[1], metric[2]], "confidence": 1.0})
-                previous = None
-                title_rows = []
-            elif re.fullmatch(r"(?:阅读|赞|分享|在看)[\d.万亿+]+", text):
-                previous = None  # 拆分的互动控件同样不能成为标题。
-                title_rows = []
+            combined = re.fullmatch(r"阅读([\d.]+万?\+?)赞([\d.]+万?\+?)", text)
+            read_only = re.fullmatch(r"阅读([\d.]+万?\+?)", text)
+            like_only = re.fullmatch(r"赞([\d.]+万?\+?)", text)
+            if combined:
+                emit_card(combined.group(1), combined.group(2))
+                reset_card()
+            elif read_only:
+                # 带图卡片会把「阅读」和「赞」拆成两个控件，不能把标题清掉。
+                pending_read = read_only.group(1)
+                if pending_like is not None:
+                    emit_card(pending_read, pending_like)
+                    reset_card()
+            elif like_only:
+                pending_like = like_only.group(1)
+                if pending_read is not None:
+                    emit_card(pending_read, pending_like)
+                    reset_card()
+            elif re.fullmatch(r"(?:分享|在看)[\d.万亿+]+", text):
+                continue
             elif text:
+                if pending_read is not None:
+                    emit_card(pending_read, pending_like)
+                    reset_card()
                 previous = row
                 x1, y1, x2, y2 = row["rect"]
                 title_rows.append(dict(text=row["text"], left=x1, top=y1, right=x2, bottom=y2))
+        emit_card(pending_read, pending_like)
+        reset_card()
     # 同一控件可能经父子节点重复暴露；仅合并标题、日期和物理位置完全相同的卡片。
     unique = {(a["time_group"], normalize(a["title"]), a["screen_point"]): a for a in articles}
     labels = list({(label["text"], label["center_y_1000"]): label for label in labels}.values())

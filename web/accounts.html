@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>公众号管理 · 公众号采集</title>
     <link rel="stylesheet" href="/app.css?v=20260802-account-ui" />
-    <link rel="stylesheet" href="/accounts.css?v=20260802-account-ui" />
+    <link rel="stylesheet" href="/accounts.css?v=20261018-account-delete" />
   </head>
   <body>
     <main class="app-shell account-shell">
@@ -33,7 +33,7 @@
         <button class="overview-card success" type="button" data-account-status="alias" aria-pressed="false">
           <span>搜索别名</span><strong id="aliasAccounts">—</strong><small>使用单独搜索名称</small>
         </button>
-        <p class="overview-note">文章数据只读；这里仅维护采集账号配置与本地搜索别名。</p>
+        <p class="overview-note">删除只会把公众号移出采集名单。已经入库的文章会保留，可以继续在文章管理里查看。</p>
       </section>
 
       <section class="account-toolbar" aria-label="公众号筛选">
@@ -85,6 +85,22 @@
       </form>
     </dialog>
 
+    <dialog class="account-dialog" id="accountDelete">
+      <form method="dialog" class="dialog-card" id="deleteForm">
+        <header class="dialog-head">
+          <div>
+            <h2>删除公众号</h2>
+            <p id="deleteMessage">删除后不再采集这个公众号。已入库文章会保留。</p>
+          </div>
+          <button class="icon-close" value="cancel" type="button" id="closeDelete" aria-label="关闭">×</button>
+        </header>
+        <footer class="dialog-actions">
+          <button class="text-button" value="cancel" type="button" id="cancelDelete">取消</button>
+          <button class="button danger-solid" type="submit" id="confirmDelete">确认删除</button>
+        </footer>
+      </form>
+    </dialog>
+
     <dialog class="account-dialog" id="accountImporter">
       <form method="dialog" class="dialog-card import-card" id="importForm">
         <header class="dialog-head"><div><h2>导入公众号配置</h2><p>先预览新增和更新，再确认保存；文件只会改动采集账号配置。</p></div><button class="icon-close" value="cancel" aria-label="关闭">×</button></header>
@@ -106,6 +122,6 @@
     </dialog>
     <div class="toast" id="toast" role="status"></div>
     <!-- 更新摘要/告警行为后更换资源版本，避免浏览器继续执行旧脚本而把“0 个待补齐”显示成警告。 -->
-    <script src="/accounts.js?v=20260803-account-summary"></script>
+    <script src="/accounts.js?v=20261018-account-delete"></script>
   </body>
 </html>

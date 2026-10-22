@@ -1619,6 +1619,94 @@ def scroll_window_down(rect: Rect, wheel_notches: int = 2) -> None:
         time.sleep(0.02)
 
 
+# 单屏最多约 4 张卡片。固定滚 2 格时，12 屏几乎还停在同一批文章上。
+PROFILE_PAGE_LIMIT = 30
+
+
+def profile_scroll_notches(anchor_y: int) -> int:
+    """按最下方卡片的纵向位置决定滚轮格数。
+
+    目标是把它滚到靠近列表顶部，同时少滚一点，让下一屏仍能看到这张卡片，
+    避免跳过中间还没采集的文章。
+    """
+    target_y = 220
+    # 实测 1 格大约移动 98 个千分位。按 140 估算会少滚，重叠部分由标题去重跳过。
+    y_per_notch = 140
+    if anchor_y <= target_y + 80:
+        return 3
+    return max(4, min(10, round((anchor_y - target_y) / y_per_notch)))
+
+
+def lowest_profile_article(articles: list[dict[str, Any]]) -> dict[str, Any] | None:
+    ranked = [item for item in articles if int(item.get("center_y_1000") or 0) > 0]
+    if not ranked:
+        return None
+    return max(ranked, key=lambda item: int(item["center_y_1000"]))
+
+
+def profile_scroll_anchor_key(article: dict[str, Any] | None) -> tuple[str, int] | None:
+    if article is None:
+        return None
+    title = canonical_title_for_match(str(article.get("title") or ""))
+    if not title:
+        return None
+    return title, int(article.get("center_y_1000") or 0) // 80
+
+
+def _same_profile_card(anchor: dict[str, Any], card: dict[str, Any]) -> bool:
+    if not titles_match(str(anchor.get("title") or ""), str(card.get("title") or "")):
+        return False
+    anchor_group = normalize_title(str(anchor.get("time_group") or ""))
+    card_group = normalize_title(str(card.get("time_group") or ""))
+    return not anchor_group or not card_group or anchor_group == card_group
+
+
+def advance_profile_list(window: WindowInfo, articles: list[dict[str, Any]]) -> int:
+    """按当前屏最下方的卡片滚动，并在滚过头时把这张卡片拉回屏幕。"""
+    anchor = lowest_profile_article(articles)
+    notches = 4 if anchor is None else profile_scroll_notches(int(anchor["center_y_1000"]))
+    activate_window(window.hwnd)
+    scroll_window_down(window.rect, notches)
+    if anchor is None or not window.hwnd:
+        return notches
+    time.sleep(0.35)
+
+    def visible_anchor() -> dict[str, Any] | None:
+        feed = profile_feed_from_uia(window)
+        matches = [card for card in feed.get("articles") or [] if _same_profile_card(anchor, card)]
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
+    recovered = 0
+    try:
+        visible = visible_anchor()
+    except Exception as exc:
+        log_event("profile_scroll_probe_failed", error=str(exc))
+        return notches
+    while visible is None and recovered < 4:
+        scroll_window_up(window.rect, 2)
+        recovered += 1
+        time.sleep(0.3)
+        try:
+            visible = visible_anchor()
+        except Exception as exc:
+            log_event("profile_scroll_probe_failed", error=str(exc))
+            break
+    if visible is not None and int(visible.get("center_y_1000") or 0) > 560:
+        extra = min(profile_scroll_notches(int(visible["center_y_1000"])), 6)
+        scroll_window_down(window.rect, extra)
+        notches += extra
+    log_event(
+        "profile_list_scrolled",
+        notches=notches,
+        anchor=str(anchor.get("title") or ""),
+        anchor_y=int(anchor.get("center_y_1000") or 0),
+        recovered=recovered,
+    )
+    return notches
+
+
 def set_clipboard_text(value: str) -> None:
     """写入 Unicode 剪贴板且不创建窗口，避免抢走微信输入焦点。"""
     import pyperclip
@@ -3030,7 +3118,17 @@ def locate_profile_article(window: WindowInfo, account: str, title: str, time_gr
         matches = [card for card in feed["articles"]
                    if titles_match(title, card["title"]) and card.get("time_group") == time_group]
         if len(matches) == 1:
-            return matches[0]["screen_point"]
+            card = matches[0]
+            if card.get("click_target") == "card-center":
+                # 标题贴在窗口底边时，三次重试不能再点同一个边缘坐标。
+                log_event(
+                    "article_click_moved_to_card_center",
+                    account=account,
+                    title=title,
+                    screen_point=list(card["screen_point"]),
+                    reason="title-clipped-at-window-bottom",
+                )
+            return card["screen_point"]
         if len(matches) > 1:
             raise RuntimeError("同一日期存在多个匹配标题，拒绝猜测文章")
         rows = [row for doc in payload.get("documents", []) for row in doc.get("rows", [])
@@ -3080,6 +3178,57 @@ def locate_ocr_card(feed: dict, title: str, time_group: str, rect: Rect) -> tupl
     return matches[0] if matches else None
 
 
+def profile_feed_has_recognition_gap(feed: dict[str, Any]) -> bool:
+    """相邻卡片纵向空档过大，或最后一张卡片下面还有大片空白时，说明有卡片没被认出来。"""
+    ys = sorted(int(article.get("center_y_1000") or 0) for article in feed.get("articles") or [])
+    if len(ys) >= 2 and any(current - previous > 420 for previous, current in zip(ys, ys[1:])):
+        return True
+    if not ys or ys[-1] >= 620:
+        return False
+    below = [
+        label for label in feed.get("time_labels") or []
+        if int(label.get("center_y_1000") or 0) > ys[-1] + 80
+    ]
+    return not any(is_older_time_boundary(str(label.get("text") or "")) for label in below)
+
+
+def merge_unrecognized_profile_cards(
+    primary: dict[str, Any],
+    extra: dict[str, Any],
+    rect: Rect,
+) -> dict[str, Any]:
+    """把 OCR 在空档里看到、无障碍树没有返回的卡片补进当前列表。"""
+    articles = [dict(article) for article in primary.get("articles") or []]
+
+    def already_known(title: str) -> bool:
+        return any(titles_match(title, str(article.get("title") or "")) for article in articles)
+
+    for article in extra.get("articles") or []:
+        title = str(article.get("title") or "").strip()
+        if len(canonical_title_for_match(title)) < 5 or already_known(title):
+            continue
+        merged = dict(article)
+        if not merged.get("screen_point"):
+            merged["screen_point"] = (
+                rect.left + round(rect.width * int(merged.get("center_x_1000") or 0) / 1000),
+                rect.top + round(rect.height * int(merged.get("center_y_1000") or 0) / 1000),
+            )
+        articles.append(merged)
+    labels = [dict(label) for label in primary.get("time_labels") or []]
+    for label in extra.get("time_labels") or []:
+        text = str(label.get("text") or "")
+        y = int(label.get("center_y_1000") or 0)
+        if any(item.get("text") == text and abs(int(item.get("center_y_1000") or 0) - y) < 50 for item in labels):
+            continue
+        labels.append(dict(label))
+    merged_feed = dict(primary)
+    merged_feed["articles"] = articles
+    merged_feed["time_labels"] = labels
+    if len(articles) != len(primary.get("articles") or []):
+        merged_feed["recognition_method"] = f"{primary.get('recognition_method', 'uia')}+ocr-gap"
+    return merged_feed
+
+
 def analyze_profile_window(
     profile_window: WindowInfo,
     output_dir: Path,
@@ -3102,6 +3251,22 @@ def analyze_profile_window(
         try:
             structured = profile_feed_from_uia(profile_window)
             if structured["articles"]:
+                if profile_feed_has_recognition_gap(structured):
+                    screenshot = capture_window(profile_window.rect)
+                    screenshot.save(output_dir / "profile-window-gap.png")
+                    try:
+                        recognized = PROFILE_OCR.inspect_profile_feed(screenshot)
+                        before_count = len(structured["articles"])
+                        structured = merge_unrecognized_profile_cards(
+                            structured, recognized, profile_window.rect
+                        )
+                        log_event(
+                            "profile_feed_gap_filled",
+                            before_count=before_count,
+                            after_count=len(structured["articles"]),
+                        )
+                    except Exception as exc:
+                        log_event("profile_feed_gap_ocr_failed", error=str(exc))
                 (output_dir / "feed.json").write_text(json.dumps(structured, ensure_ascii=False), encoding="utf-8")
                 return structured
         except RuntimeError as exc:
@@ -3269,20 +3434,15 @@ def select_latest_article_group(articles: list[dict[str, Any]]) -> list[dict[str
 
 
 PROMOTION_TITLE_KEYWORDS = (
-    "招聘",
-    "招募",
-    "诚聘",
-    "投稿合作",
-    "商务合作",
-    "广告合作",
     # 远程桌面浮层可能覆盖公众号窗口并被 OCR 当成卡片，必须在点击前过滤。
+    # 招聘、招募、合作等真实文章标题不再拦截，按普通文章采集并保存。
     "ToDesk",
     "设备代码",
 )
 
 
 def promotion_reason(title: str) -> str | None:
-    """识别不需要采集的招聘、招募及合作推广卡片。"""
+    """只拦截远程桌面浮层误识别出的卡片，不按标题内容丢弃文章。"""
     normalized = normalize_title(title)
     for keyword in PROMOTION_TITLE_KEYWORDS:
         if normalize_title(keyword) in normalized:
@@ -3291,13 +3451,38 @@ def promotion_reason(title: str) -> str | None:
 
 
 def is_older_time_boundary(value: str) -> bool:
-    """星期标签或明确年月日均表示已经早于昨天，应停止继续采集。"""
+    """星期或具体日期表示早于「昨天」。匹配任意星期几，不认某一个固定日期。"""
     text = unicodedata.normalize("NFKC", value or "").strip()
     return bool(
         re.search(r"(?:星期|周)[一二三四五六日天1-7]", text)
         or re.search(r"(?:\d{4}年)?\d{1,2}月\d{1,2}日", text)
         or re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", text)
     )
+
+
+def is_past_scan_range(value: str, scan_range: str) -> bool:
+    """分组是否已经早于本次要采集的范围。
+
+    选「今天」时，出现「昨天」就停。选「昨天」或「今天和昨天」时，离开这两个
+    分组就停。微信对更早的一天显示星期几，星期几每天都变，因此只要不是今天
+    或昨天即停止，不依赖「星期三」这类具体文字。
+    """
+    text = unicodedata.normalize("NFKC", value or "").strip()
+    if not text or text == "置顶":
+        return False
+    if "今天" in text or re.fullmatch(r"\d{1,2}:\d{2}", text):
+        return False
+    if "昨天" in text:
+        return scan_range == "today"
+    return True
+
+
+def scan_range_end_reason(scan_range: str) -> str:
+    return {
+        "today": "已离开「今天」",
+        "yesterday": "已离开「昨天」",
+        "today_yesterday": "已离开「今天和昨天」",
+    }.get(scan_range, "已离开本次扫描范围")
 
 
 def is_recent_time_group(value: str, scan_range: str = "today_yesterday") -> bool:
@@ -3422,7 +3607,7 @@ def collect_searched_account(
                 (
                     str(item.get("text") or "")
                     for item in time_labels
-                    if is_older_time_boundary(str(item.get("text") or ""))
+                    if is_past_scan_range(str(item.get("text") or ""), scan_range)
                 ),
                 "",
             )
@@ -3535,7 +3720,7 @@ def collect_searched_account(
                 stop_reason = f"达到文章上限 {max_articles}"
                 break
             if older_boundary:
-                stop_reason = f"遇到更早时间边界：{older_boundary}"
+                stop_reason = scan_range_end_reason(scan_range)
                 break
             activate_window(account_window.hwnd)
             scroll_window_up(account_window.rect)
@@ -3618,6 +3803,8 @@ def collect_profile_account(
         else None
     )
     stop_reason = "达到最大翻页数"
+    stale_scrolls = 0
+    last_scroll_anchor: tuple[str, int] | None = None
     partial_summary_path = output_dir / "partial-summary.json"
 
     def write_partial_checkpoint() -> None:
@@ -3673,7 +3860,7 @@ def collect_profile_account(
             observed_name=observed_account_name,
         )
 
-        for page_index in range(1, 13):
+        for page_index in range(1, PROFILE_PAGE_LIMIT + 1):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"账号 {account_name} 达到任务超时限制")
             # 每次滚屏后的顶部可能是上一分区残留的贴图/视频卡片。不能沿用
@@ -3711,7 +3898,7 @@ def collect_profile_account(
                 if event["kind"] == "label":
                     label = str(event.get("text") or "").strip()
                     current_group = label
-                    if is_older_time_boundary(label):
+                    if is_past_scan_range(label, scan_range):
                         older_boundary = label
                     continue
                 observed_card_count += 1
@@ -3979,15 +4166,25 @@ def collect_profile_account(
                     if title_signature is not None:
                         terminal_card_title_signatures.add(title_signature)
 
+            anchor_key = profile_scroll_anchor_key(lowest_profile_article(feed.get("articles") or []))
+            if anchor_key is None or anchor_key == last_scroll_anchor:
+                stale_scrolls += 1
+            else:
+                stale_scrolls = 0
+            last_scroll_anchor = anchor_key
             if processed_count >= max_articles:
                 stop_reason = f"达到文章上限 {max_articles}"
                 break
             if older_boundary:
-                stop_reason = f"遇到更早时间边界：{older_boundary}"
+                stop_reason = scan_range_end_reason(scan_range)
                 break
-            activate_window(profile_window.hwnd)
-            scroll_window_down(profile_window.rect)
-            time.sleep(0.8)
+            if stale_scrolls >= 2:
+                stop_reason = "列表滚动没有继续下移"
+                break
+            if page_index >= PROFILE_PAGE_LIMIT:
+                break
+            advance_profile_list(profile_window, feed.get("articles") or [])
+            time.sleep(0.4)
     finally:
         propagating_error = sys.exc_info()[0] is not None
         if profile_window and profile_window.shared_browser and profile_window.profile_checkpoint:

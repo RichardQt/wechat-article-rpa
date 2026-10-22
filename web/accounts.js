@@ -46,7 +46,14 @@ const elements = {
   editAccountType: document.querySelector("#editAccountType"),
   renameNote: document.querySelector("#renameNote"),
   categoryOptions: document.querySelector("#categoryOptions"),
+  deleter: document.querySelector("#accountDelete"),
+  deleteMessage: document.querySelector("#deleteMessage"),
+  confirmDelete: document.querySelector("#confirmDelete"),
+  cancelDelete: document.querySelector("#cancelDelete"),
+  closeDelete: document.querySelector("#closeDelete"),
+  deleteForm: document.querySelector("#deleteForm"),
 };
+let pendingDelete = null;
 
 function toast(message) {
   elements.toast.textContent = message;
@@ -169,7 +176,12 @@ function render(items) {
     link.className = "account-action";
     link.href = `/articles.html?account=${encodeURIComponent(item.name)}&date=all`;
     link.textContent = "查看文章";
-    action.append(edit, link);
+    const remove = document.createElement("button");
+    remove.className = "account-action action-button danger";
+    remove.type = "button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => openDelete(item));
+    action.append(edit, link, remove);
 
     row.append(name, createCell(safeText(item.category)), search, createCell(number(item.article_count)), createCell(safeText(item.latest_publish)), status, action);
     elements.list.appendChild(row);
@@ -305,6 +317,42 @@ async function saveAccount(event) {
   }
 }
 
+function openDelete(item) {
+  pendingDelete = item;
+  const kept = Number(item.article_count) || 0;
+  elements.deleteMessage.textContent = kept
+    ? `「${item.name}」会从采集名单移除，之后不再采集。已入库的 ${kept.toLocaleString("zh-CN")} 篇文章会保留。`
+    : `「${item.name}」会从采集名单移除，之后不再采集。当前没有入库文章。`;
+  elements.deleter.showModal();
+}
+
+async function confirmDelete(event) {
+  event.preventDefault();
+  if (!pendingDelete) return;
+  const item = pendingDelete;
+  elements.confirmDelete.disabled = true;
+  elements.confirmDelete.textContent = "删除中…";
+  try {
+    const data = await requestJson("/api/accounts/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ record_id: item.id }),
+    });
+    elements.deleter.close();
+    pendingDelete = null;
+    toast(data.message || "已从采集名单删除");
+    if (elements.list.querySelectorAll("tr").length <= 1 && offset > 0) {
+      offset = Math.max(0, offset - pageSize);
+    }
+    loadAccounts();
+  } catch (error) {
+    toast(error.message || "删除公众号失败");
+  } finally {
+    elements.confirmDelete.disabled = false;
+    elements.confirmDelete.textContent = "确认删除";
+  }
+}
+
 function restartQuery() { offset = 0; loadAccounts(); }
 
 function exportAccounts(event) {
@@ -332,6 +380,9 @@ elements.cancelExport.addEventListener("click", () => elements.exporter.close())
 elements.exportForm.addEventListener("submit", exportAccounts);
 elements.importButton.addEventListener("click", () => { resetImporter(); elements.importer.showModal(); });
 elements.cancelEdit.addEventListener("click", () => elements.editor.close());
+elements.cancelDelete.addEventListener("click", () => elements.deleter.close());
+elements.closeDelete.addEventListener("click", () => elements.deleter.close());
+elements.deleteForm.addEventListener("submit", confirmDelete);
 elements.cancelImport.addEventListener("click", () => elements.importer.close());
 elements.accountForm.addEventListener("submit", saveAccount);
 elements.previewImport.addEventListener("click", previewImport);

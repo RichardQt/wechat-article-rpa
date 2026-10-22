@@ -1116,6 +1116,43 @@ def upsert_account_config(
             client.close()
 
 
+def delete_account_config(
+    record_id: str,
+    *,
+    target_collection: Any | None = None,
+    article_collection: Any | None = None,
+    aliases: dict[str, str] | None = None,
+    persist_aliases: bool = True,
+) -> dict[str, Any]:
+    """从采集名单移除一个公众号。只删 collection_target 和本地搜索别名，不删已入库文章。"""
+    normalized_id = str(record_id or "").strip()
+    if not normalized_id:
+        raise ValueError("缺少公众号记录ID")
+    if len(normalized_id) > 80:
+        raise ValueError("记录ID不能超过 80 个字符")
+    client = None
+    if target_collection is None or article_collection is None:
+        target_collection, article_collection, client = _account_collections()
+    try:
+        current = _existing_account_rows(target_collection).get(normalized_id)
+        if current is None:
+            raise ValueError("公众号不存在或已经删除")
+        name = str(current.get("name") or "")
+        # 只读取文章数量，用来告诉操作者历史文章仍在；这里没有任何文章删除调用。
+        articles_kept = int(article_collection.count_documents({"account.name": name})) if name else 0
+        deleted = target_collection.delete_one({"_id": current["_id"]})
+        if getattr(deleted, "deleted_count", 0) != 1:
+            raise ValueError("公众号不存在或已经删除")
+        alias_map = aliases if aliases is not None else load_account_aliases()
+        alias_map.pop(name, None)
+        if persist_aliases:
+            _write_json_atomically(ACCOUNT_ALIASES_PATH, alias_map)
+        return {"record_id": normalized_id, "name": name, "articles_kept": articles_kept}
+    finally:
+        if client is not None:
+            client.close()
+
+
 class RunHistory:
     """控制台的持久化任务历史。
 
@@ -2665,6 +2702,17 @@ class ControlHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/accounts/upsert":
                 result = upsert_account_config(payload)
                 self._json({"ok": True, **result, "message": "公众号配置已保存"})
+                return
+            if self.path == "/api/accounts/delete":
+                result = delete_account_config(str(payload.get("record_id") or ""))
+                kept = int(result["articles_kept"])
+                self._json(
+                    {
+                        "ok": True,
+                        **result,
+                        "message": f"已从采集名单删除「{result['name']}」，保留已入库文章 {kept} 篇。",
+                    }
+                )
                 return
             if self.path == "/api/preflight/recover":
                 self._json(recover_sogou_preflight())

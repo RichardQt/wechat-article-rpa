@@ -148,7 +148,54 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(len(feed["articles"]), 1)
         self.assertEqual(feed["time_labels"][0]["text"], "今天")
         self.assertEqual(feed["articles"][0]["screen_point"], (400, 410))
+        self.assertEqual(feed["articles"][0]["click_target"], "title")
         self.assertEqual(feed["articles"][0]["list_read_count"], 33000)
+
+    def test_bottom_clipped_title_clicks_card_center(self):
+        """标题下沿超出窗口时，点击日期与标题之间的封面中部。"""
+        def row(text, top, left=473, right=998, bottom=None, offscreen=False):
+            return {
+                "text": text,
+                "rect": [left, top, right, top + 27 if bottom is None else bottom],
+                "offscreen": offscreen,
+            }
+        data = {"hwnd": 1, "documents": [{"id": [1], "name": "秦淮发布", "rows": [
+            row("全部", 142, right=491, bottom=182),
+            row("文章", 142, left=605, right=647, bottom=182),
+            row("私信", 90, left=617, right=722, bottom=126),
+            row("昨天", 1198, right=509, bottom=1222),
+            row("古今和鸣，东西互鉴，世界钢琴大师走进中国科举博物馆", 1511, bottom=1538),
+            row("阅读436赞10", 1547, right=607, bottom=1571, offscreen=True),
+        ]}]}
+        feed = feed_from_probe(data, (0, 0, 1485, 1528), "秦淮发布")
+        self.assertEqual(len(feed["articles"]), 1)
+        article = feed["articles"][0]
+        self.assertEqual(article["click_target"], "card-center")
+        self.assertEqual(article["screen_point"], (736, 1366))
+        self.assertGreater(article["center_y_1000"], 990)
+
+    def test_split_read_and_like_rows_still_form_one_card(self):
+        def row(text, y):
+            return {"text": text, "rect": [200, y, 600, y + 20], "offscreen": False}
+        data = {"hwnd": 1, "documents": [{"id": [1], "name": "甲", "rows": [
+            row("全部", 60), row("文章", 80), row("私信", 100), row("昨天", 150),
+            row("带图卡片的完整标题", 300), row("阅读1.2万", 340), row("赞15", 360),
+        ]}]}
+        feed = feed_from_probe(data, (0, 0, 1000, 1000), "甲")
+        self.assertEqual([article["title"] for article in feed["articles"]], ["带图卡片的完整标题"])
+        self.assertEqual(feed["articles"][0]["list_read_count"], 12000)
+        self.assertEqual(feed["articles"][0]["list_like_count"], 15)
+
+    def test_like_before_read_still_forms_one_card(self):
+        def row(text, y):
+            return {"text": text, "rect": [200, y, 600, y + 20], "offscreen": False}
+        data = {"hwnd": 1, "documents": [{"id": [1], "name": "甲", "rows": [
+            row("全部", 60), row("文章", 80), row("私信", 100), row("昨天", 150),
+            row("先出现赞的卡片标题", 300), row("赞8", 340), row("阅读900", 360),
+        ]}]}
+        feed = feed_from_probe(data, (0, 0, 1000, 1000), "甲")
+        self.assertEqual(feed["articles"][0]["list_read_count"], 900)
+        self.assertEqual(feed["articles"][0]["list_like_count"], 8)
 
 
 if __name__ == "__main__":

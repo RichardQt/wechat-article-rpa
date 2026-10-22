@@ -7,6 +7,7 @@ from datetime import date, datetime
 
 from wechat_visual_rpa import (
     build_card_title_signature,
+    is_past_scan_range,
     is_recent_time_group,
     publish_time_matches_scan_range,
 )
@@ -22,6 +23,18 @@ class ScanRangeTests(unittest.TestCase):
         self.assertTrue(is_recent_time_group("昨天", "yesterday"))
         self.assertFalse(is_recent_time_group("08:40", "yesterday"))
         self.assertFalse(is_recent_time_group("今天", "yesterday"))
+
+    def test_stop_follows_the_selected_range_not_a_weekday_name(self) -> None:
+        for weekday in ("星期一", "星期三", "星期日", "周四"):
+            self.assertTrue(is_past_scan_range(weekday, "yesterday"))
+            self.assertTrue(is_past_scan_range(weekday, "today_yesterday"))
+            self.assertTrue(is_past_scan_range(weekday, "today"))
+        self.assertTrue(is_past_scan_range("昨天", "today"))
+        self.assertFalse(is_past_scan_range("昨天", "yesterday"))
+        self.assertFalse(is_past_scan_range("昨天", "today_yesterday"))
+        self.assertFalse(is_past_scan_range("今天", "yesterday"))
+        self.assertFalse(is_past_scan_range("08:40", "today"))
+        self.assertFalse(is_past_scan_range("置顶", "today"))
 
     def test_both_range_and_older_boundaries(self) -> None:
         self.assertTrue(is_recent_time_group("昨天", "today_yesterday"))
