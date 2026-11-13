@@ -35,6 +35,8 @@ class ScanRangeTests(unittest.TestCase):
         self.assertFalse(is_past_scan_range("今天", "yesterday"))
         self.assertFalse(is_past_scan_range("08:40", "today"))
         self.assertFalse(is_past_scan_range("置顶", "today"))
+        self.assertFalse(is_past_scan_range("贴图", "yesterday"))
+        self.assertFalse(is_past_scan_range("视频号", "today_yesterday"))
 
     def test_both_range_and_older_boundaries(self) -> None:
         self.assertTrue(is_recent_time_group("昨天", "today_yesterday"))

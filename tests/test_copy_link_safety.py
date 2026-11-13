@@ -37,6 +37,17 @@ class CopyArticleUrlSafetyTests(unittest.TestCase):
             patch.object(rpa, "load_menu_button_position_cache", return_value=None),
             patch.object(rpa, "save_menu_button_position_cache"),
             patch.object(rpa, "clear_menu_button_position_cache"),
+            patch.object(
+                rpa.PROFILE_OCR,
+                "locate_browser_menu_button",
+                return_value={
+                    "found": True,
+                    "center_x_1000": 670,
+                    "center_y_1000": 24,
+                    "confidence": 0.8,
+                    "method": "opencv-browser-ellipsis",
+                },
+            ),
         )
 
     def test_validated_cache_is_used_before_full_ocr(self) -> None:
@@ -199,6 +210,74 @@ class CopyArticleUrlSafetyTests(unittest.TestCase):
         self.assertTrue(result["found"], result)
         self.assertLess(abs(result["center_x_1000"] - 866), 8)
         self.assertLess(abs(result["center_y_1000"] - 17), 8)
+
+    def test_tab_ellipsis_stays_left_of_yuanbao_summary(self) -> None:
+        """总结按钮里的圆点不能盖过当前标签标题旁的三点菜单。"""
+        screenshot = Image.new("RGB", (1000, 600), "white")
+        draw = ImageDraw.Draw(screenshot)
+        for center_x in (620, 632, 644):
+            draw.ellipse((center_x - 3, 17, center_x + 3, 23), fill="black")
+        for center_x in (860, 872, 884):
+            draw.ellipse((center_x - 3, 17, center_x + 3, 23), fill="black")
+        summary = {
+            "text": "总结 由元宝提供",
+            "normalized": "总结由元宝提供",
+            "left": 820.0,
+            "right": 980.0,
+            "top": 8.0,
+            "bottom": 32.0,
+            "center_x": 900.0,
+            "center_y": 20.0,
+            "confidence": 0.99,
+        }
+        with patch.object(rpa.PROFILE_OCR, "_rows", return_value=[summary]):
+            result = rpa.PROFILE_OCR.locate_browser_menu_button(screenshot)
+
+        self.assertTrue(result["found"], result)
+        self.assertLess(abs(result["center_x_1000"] - 632), 8)
+
+    def test_light_tab_dots_win_over_dark_title_ellipsis(self) -> None:
+        """标题文字里的深色省略号不能盖过标签按钮上的浅灰三点。"""
+        screenshot = Image.new("RGB", (1000, 600), "white")
+        draw = ImageDraw.Draw(screenshot)
+        for center_x in (620, 632, 644):
+            draw.ellipse((center_x - 3, 17, center_x + 3, 23), fill="black")
+        for center_x in (740, 746, 752):
+            draw.rectangle((center_x, 23, center_x + 1, 24), fill=(150, 150, 150))
+        summary = {
+            "text": "总结 由元宝提供",
+            "normalized": "总结由元宝提供",
+            "left": 820.0,
+            "right": 980.0,
+            "top": 8.0,
+            "bottom": 32.0,
+            "center_x": 900.0,
+            "center_y": 20.0,
+            "confidence": 0.99,
+        }
+        with patch.object(rpa.PROFILE_OCR, "_rows", return_value=[summary]):
+            result = rpa.PROFILE_OCR.locate_browser_menu_button(screenshot)
+
+        self.assertTrue(result["found"], result)
+        self.assertLess(abs(result["center_x_1000"] - 746), 8)
+
+    def test_cached_menu_on_summary_button_is_rejected(self) -> None:
+        cached = {"center_x_1000": 900, "center_y_1000": 20, "confidence": 0.9}
+        summary = {
+            "text": "总结",
+            "normalized": "总结",
+            "left": 820.0,
+            "right": 900.0,
+            "top": 8.0,
+            "bottom": 32.0,
+            "center_x": 860.0,
+            "center_y": 20.0,
+            "confidence": 0.99,
+        }
+        with patch.object(rpa.PROFILE_OCR, "_rows", return_value=[summary]):
+            result = rpa.validate_cached_menu_button_action(self.screenshot, cached)
+        self.assertFalse(result["found"])
+        self.assertIn("总结", result["reason"])
 
     def test_verified_menu_cache_survives_unrelated_live_ellipsis(self) -> None:
         """实时检测到网页三点时，继续优先尝试已通过 URL 验证的菜单坐标。"""

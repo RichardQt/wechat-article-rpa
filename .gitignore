@@ -7,10 +7,20 @@ config/control_panel.json
 config/run_history.json
 config/account_aliases.json
 config/accounts_remaining.txt
+config/ui_position_cache.json
 .env
 .env.*
 !.env.example
 !.env.mongo.example
+
+# 本地运行产物：数据库导出、旧版整仓备份、推送服务日志。
+weixin_*.sql
+backup_mongodb/
+push/app*.log
+push/logs/
+
+# 一次性检查脚本（含本机数据库口令，仅本地使用）
+temp_check_sync_flag.py
 
 # 本地界面验收截图仅用于开发时对比，不纳入产品代码仓库。
 design-qa-*.png

@@ -88,6 +88,9 @@ def _account_name_match(expected_name: str, observed_name: str) -> tuple[bool, s
         return True, "edge-punctuation-ignored"
     suffix = observed[len(expected) :] if observed.startswith(expected) else ""
     # 微信搜一搜会把认证账号的主体类型拼在名称 OCR 行末，例如“书生Intern 事业单位”。
+    # 蓝色认证标和名称还常被合成一行并插入逗号，例如“鼓楼微讯,政府”。
+    # 只去掉这段后缀两端的标点，不接受后缀本身以外的其他文字。
+    suffix = _strip_ocr_edge_punctuation(suffix)
     # 仅放行固定身份标签，且仍须在后续卡片中找到“原创内容”等证据，避免扩大误匹配范围。
     safe_suffixes = {
         "媒体",
@@ -127,6 +130,11 @@ TIME_LABEL_RE = re.compile(
     r"(?:\d{4}年)?\d{1,2}月\d{1,2}日)$"
 )
 NON_ARTICLE_SECTION_LABELS = {"贴图", "视频号"}
+# 文章浏览器三点菜单里与「复制链接」左对齐的其他菜单项。
+BROWSER_MENU_LABELS = (
+    "刷新", "调整文字大小", "全文翻译", "听全文", "查找", "打印", "投诉", "转发",
+    "分享到朋友圈", "收藏", "星标", "用默认浏览器打开", "浏览记录", "下载内容", "关闭全部标签页",
+)
 METRIC_FRIEND_SUFFIX = r"(?:\s*[\d.]+万?\+?个朋友(?:看过|转发))?"
 METRICS_RE = re.compile(
     rf"^阅读\s*([\d.]+万?\+?)\s*赞\s*([\d.]+万?\+?){METRIC_FRIEND_SUFFIX}$"
@@ -168,20 +176,38 @@ class WeChatProfileOCR:
         return rows
 
     def locate_copy_link_action(self, screenshot: Image.Image) -> dict[str, Any]:
-        """在文章浏览器菜单中定位“复制链接”，避免依赖不同电脑上的固定坐标。"""
+        """在文章浏览器菜单中定位“复制链接”，避免依赖不同电脑上的固定坐标。
+
+        新版菜单跟着当前标签上的三点弹出，标签一多整块菜单会移到窗口左侧，
+        不能按横向位置筛选。改为要求同一列还有其他浏览器菜单项，以排除正文里
+        偶然出现的同名文字。
+        """
         width, height = screenshot.size
+        rows = self._rows(screenshot)
         candidates = [
             row
-            for row in self._rows(screenshot)
+            for row in rows
             if "复制" in row["normalized"]
             and "链接" in row["normalized"]
-            # 浏览器菜单位于窗口上半部分；排除正文中偶然出现的同名文字。
+            # 浏览器菜单位于窗口上半部分。
             and row["center_y"] < height * 0.45
-            and row["center_x"] > width * 0.30
         ]
         if not candidates:
             return {"found": False, "reason": "浏览器菜单中未识别到复制链接"}
-        row = min(candidates, key=lambda item: (item["center_y"], -item["confidence"]))
+        column_tolerance = max(6.0, width * 0.015)
+        in_menu = [
+            candidate
+            for candidate in candidates
+            if any(
+                row is not candidate
+                and row["normalized"].startswith(BROWSER_MENU_LABELS)
+                and abs(row["left"] - candidate["left"]) <= column_tolerance
+                for row in rows
+            )
+        ]
+        if not in_menu:
+            return {"found": False, "reason": "复制链接同列没有其他浏览器菜单项，可能是正文文字"}
+        row = min(in_menu, key=lambda item: (item["center_y"], -item["confidence"]))
         return {
             "found": True,
             "text": row["text"],
@@ -191,11 +217,28 @@ class WeChatProfileOCR:
             "method": "rapidocr-browser-copy-link",
         }
 
+    def summary_button_left(self, screenshot: Image.Image) -> float | None:
+        """返回标题栏「总结 由元宝提供」按钮的左边界。
+
+        新版把文章菜单的三个点放进当前标签，右上角改成这个总结按钮。
+        三个点必须落在它左边，不能再按窗口右缘去点。
+        """
+        width, height = screenshot.size
+        limit_y = max(44, min(round(height * 0.08), 80))
+        lefts = [
+            row["left"]
+            for row in self._rows(screenshot)
+            if row["center_y"] <= limit_y
+            and row["center_x"] > width * 0.45
+            and ("总结" in row["normalized"] or "元宝" in row["normalized"])
+        ]
+        return min(lefts) if lefts else None
+
     def locate_browser_menu_button(self, screenshot: Image.Image) -> dict[str, Any]:
         """通过标题栏中的三个横向圆点定位浏览器“更多”菜单按钮。
 
-        这里只分析截图顶部右半区，并要求三个小连通域水平对齐、间距接近，
-        避免把最小化、最大化或正文中的省略号当成菜单按钮。
+        旧版三个点在窗口右上角。新版移到当前标签标题右侧，原来的位置变成
+        「总结 由元宝提供」。找到总结按钮时，只在它左边的标签栏里找三个点。
         """
         rgb = np.asarray(screenshot.convert("RGB"))
         height, width = rgb.shape[:2]
@@ -205,17 +248,65 @@ class WeChatProfileOCR:
         # 只检查浏览器顶部工具栏。文章正文和网页工具栏也可能出现“...”，
         # 如果把识别区域放到页面内容区，会误点网页自身的分享/更多按钮。
         title_bottom = max(44, min(round(height * 0.06), 72))
-        search_left = round(width * 0.45)
-        search_right = round(width * 0.96)
+        summary_left = self.summary_button_left(screenshot)
+        if summary_left is not None:
+            search_left = round(width * 0.12)
+            search_right = int(summary_left) - 8
+        else:
+            search_left = round(width * 0.45)
+            search_right = round(width * 0.96)
+        if search_right - search_left < 30:
+            return {"found": False, "reason": "总结按钮左侧没有可搜索的标签栏"}
+        found = None
+        if summary_left is not None:
+            # 当前标签上的菜单点是浅灰色小圆点。深色阈值会先命中标题里的省略号。
+            found = self._ellipsis_from_toolbar(
+                rgb,
+                title_bottom,
+                search_left,
+                search_right,
+                width,
+                height,
+                threshold=200,
+                max_dot_size=4,
+                min_area=2,
+            )
+        if found is None:
+            found = self._ellipsis_from_toolbar(
+                rgb,
+                title_bottom,
+                search_left,
+                search_right,
+                width,
+                height,
+                threshold=105,
+                max_dot_size=max(9, round(title_bottom * 0.18)),
+            )
+        if found is None:
+            return {"found": False, "reason": "标题栏未识别到三点菜单按钮"}
+        return found
+
+    def _ellipsis_from_toolbar(
+        self,
+        rgb: np.ndarray,
+        title_bottom: int,
+        search_left: int,
+        search_right: int,
+        width: int,
+        height: int,
+        *,
+        threshold: int,
+        max_dot_size: int,
+        min_area: int = 1,
+    ) -> dict[str, Any] | None:
         gray = cv2.cvtColor(rgb[:title_bottom, search_left:search_right], cv2.COLOR_RGB2GRAY)
-        # 标题栏通常是浅色背景；较严格的深色阈值可排除大部分抗锯齿文字边缘。
-        mask = cv2.threshold(gray, 105, 255, cv2.THRESH_BINARY_INV)[1]
+        mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)[1]
         component_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
         dots: list[dict[str, float]] = []
-        max_dot_size = max(9, round(title_bottom * 0.18))
+        max_area = max_dot_size * max_dot_size
         for index in range(1, component_count):
-            left, top, box_width, box_height, area = stats[index]
-            if not (1 <= area <= max_dot_size * max_dot_size):
+            _left, _top, box_width, box_height, area = stats[index]
+            if not (min_area <= area <= max_area):
                 continue
             if not (1 <= box_width <= max_dot_size and 1 <= box_height <= max_dot_size):
                 continue
@@ -260,8 +351,7 @@ class WeChatProfileOCR:
                     )
                     if size_similarity < 0.45:
                         continue
-                    # 优先选择标题栏更靠右、也更靠上的候选；浏览器菜单通常位于
-                    # 标签栏/工具栏右侧，而不是网页正文区域。
+                    # 优先选择标签栏更靠右、也更靠上的候选。总结按钮右侧已经被排除。
                     rightness = third["x"] / max(search_right - search_left, 1)
                     topness = 1.0 - min(1.0, max(first["y"], second["y"], third["y"]) / title_bottom)
                     score = (
@@ -274,7 +364,7 @@ class WeChatProfileOCR:
                         best = (score, first, second, third)
 
         if best is None:
-            return {"found": False, "reason": "标题栏未识别到三点菜单按钮"}
+            return None
         score, first, second, third = best
         center_x = search_left + (first["x"] + second["x"] + third["x"]) / 3
         center_y = (first["y"] + second["y"] + third["y"]) / 3
@@ -337,8 +427,19 @@ class WeChatProfileOCR:
             "method": "rapidocr-wechat-network-search-entry",
         }
 
-    def locate_search_result(self, screenshot: Image.Image, expected_name: str) -> dict[str, Any]:
-        """定位搜一搜“账号/公众号”结果中的精确名称，排除顶部输入框和相似账号。"""
+    def locate_search_result(
+        self,
+        screenshot: Image.Image,
+        expected_name: str,
+        *,
+        filter_name: str = "",
+        filter_confirmed: bool = False,
+    ) -> dict[str, Any]:
+        """定位搜一搜“账号/公众号”结果中的精确名称，排除顶部输入框和相似账号。
+
+        ``filter_confirmed`` 表示调用方已在同一张截图上确认二级筛选（公众号/
+        服务号）处于选中状态；此时筛选栏本身就是账号类型证据。
+        """
         width, height = screenshot.size
         expected = _normalize(expected_name)
         rows = self._rows(screenshot)
@@ -415,7 +516,10 @@ class WeChatProfileOCR:
         official_type_evidence = [
             item["text"]
             for item in nearby_rows
-            if item["normalized"] == "公众号"
+            if item["normalized"] in {"公众号", "服务号"}
+            or "服务号" in item["normalized"]
+            or "公众号" in item["normalized"]
+            or item["normalized"] in {"政府", "事业单位", "企业", "官方", "机构"}
         ]
         original_content_evidence = [
             item["text"]
@@ -426,7 +530,16 @@ class WeChatProfileOCR:
             item["text"] for item in nearby_rows if item["normalized"] == "个人"
         ]
         official_evidence = official_type_evidence + original_content_evidence
-        if not official_evidence:
+        # 二级筛选（公众号/服务号）已确认选中时，筛选栏本身已经限定了结果类型。
+        # 服务号卡片经常只显示认证主体（如“南京大数据集团有限公司”）和蓝色
+        # 认证标，不再重复显示“服务号”或“篇原创内容”，不能因此把正确账号
+        # 判成无关账号。筛选未确认时仍要求卡片内出现类型或原创内容证据。
+        filter_evidence = (
+            f"二级{filter_name}筛选已确认"
+            if filter_confirmed and filter_name in {"公众号", "服务号"}
+            else ""
+        )
+        if not official_evidence and not filter_evidence:
             return {
                 "found": False,
                 "reason": "同名搜索结果缺少公众号内容证据，拒绝点击可能的无关账号",
@@ -440,7 +553,9 @@ class WeChatProfileOCR:
             (
                 item["text"]
                 for item in nearby_rows
-                if item["normalized"] != "公众号"
+                if item["normalized"] not in {"公众号", "服务号"}
+                and "服务号" not in item["normalized"]
+                and "公众号" not in item["normalized"]
                 and "篇原创内容" not in item["normalized"]
             ),
             "",
@@ -451,7 +566,7 @@ class WeChatProfileOCR:
             "matched_name": row["text"],
             "name_match_method": name_match_method,
             "company": company,
-            "official_evidence": official_evidence,
+            "official_evidence": ([filter_evidence] if filter_evidence else []) + official_evidence,
             "original_content_evidence": original_content_evidence,
             "is_official_account": True,
             "center_x_1000": round(row["center_x"] * 1000 / width),
@@ -493,52 +608,60 @@ class WeChatProfileOCR:
             "method": "rapidocr-sogou-account-tab-subregion",
         }
 
-    def locate_official_account_filter(self, screenshot: Image.Image) -> dict[str, Any]:
-        """定位“账号”分类下的二级“公众号”筛选项。"""
+    def locate_official_account_filter(
+        self, screenshot: Image.Image, filter_name: str = "公众号"
+    ) -> dict[str, Any]:
+        """定位“账号”分类下的二级筛选项（默认“公众号”，可指定“服务号”等）。"""
         width, height = screenshot.size
         candidates = [
             row
             for row in self._rows(screenshot)
-            if "公众号" in row["normalized"]
+            if filter_name in row["normalized"]
             and height * 0.12 <= row["center_y"] <= height * 0.38
-            and row["center_x"] < width * 0.55
+            and (row["center_x"] < width * 0.65 or row["left"] < width * 0.55)
         ]
         if not candidates:
-            return {"found": False, "reason": "账号结果页未找到二级公众号筛选项"}
+            return {"found": False, "reason": f"账号结果页未找到二级{filter_name}筛选项"}
 
         row = min(candidates, key=lambda item: item["center_y"])
         normalized = row["normalized"]
-        official_index = normalized.index("公众号")
+        official_index = normalized.index(filter_name)
         char_width = (row["right"] - row["left"]) / max(len(normalized), 1)
         official_left = row["left"] + char_width * official_index
-        official_right = official_left + char_width * 3
+        official_right = official_left + char_width * len(filter_name)
         return {
             "found": True,
             "center_x_1000": round((official_left + official_right) / 2 * 1000 / width),
             "center_y_1000": round(row["center_y"] * 1000 / height),
             "confidence": row["confidence"],
             "ocr_text": row["text"],
-            "method": "rapidocr-sogou-official-account-filter-subregion",
+            "method": (
+                "rapidocr-sogou-official-account-filter-subregion"
+                if filter_name == "公众号"
+                else f"rapidocr-sogou-{filter_name}-filter-subregion"
+            ),
         }
 
-    def validate_official_account_filter_selected(self, screenshot: Image.Image) -> dict[str, Any]:
-        """通过文字颜色确认二级“公众号”已选中；选中项明显深于其他筛选项。"""
+    def validate_official_account_filter_selected(
+        self, screenshot: Image.Image, filter_name: str = "公众号"
+    ) -> dict[str, Any]:
+        """通过文字颜色确认二级筛选项已选中；选中项明显深于其他筛选项。"""
         width, height = screenshot.size
         candidates = [
             row
             for row in self._rows(screenshot)
-            if "公众号" in row["normalized"]
+            if filter_name in row["normalized"]
             and height * 0.12 <= row["center_y"] <= height * 0.38
-            and row["center_x"] < width * 0.55
+            and (row["center_x"] < width * 0.65 or row["left"] < width * 0.55)
         ]
         if not candidates:
-            return {"selected": False, "reason": "未找到二级公众号筛选文字"}
+            return {"selected": False, "reason": f"未找到二级{filter_name}筛选文字"}
         row = min(candidates, key=lambda item: item["center_y"])
         normalized = row["normalized"]
-        official_index = normalized.index("公众号")
+        official_index = normalized.index(filter_name)
         char_width = (row["right"] - row["left"]) / max(len(normalized), 1)
         left = max(0, round(row["left"] + char_width * official_index))
-        right = min(width, round(left + char_width * 3))
+        right = min(width, round(left + char_width * len(filter_name)))
         top = max(0, round(row["top"]))
         bottom = min(height, round(row["bottom"]))
         crop = np.asarray(screenshot.convert("L").crop((left, top, right, bottom)))
@@ -548,7 +671,7 @@ class WeChatProfileOCR:
         return {
             "selected": selected,
             "foreground_median": round(median, 2),
-            "reason": "" if selected else "公众号文字仍为未选中的浅色",
+            "reason": "" if selected else f"{filter_name}文字仍为未选中的浅色",
             "method": "opencv-secondary-filter-text-darkness",
         }
 
@@ -703,9 +826,19 @@ class WeChatProfileOCR:
             is_section_label = normalized in NON_ARTICLE_SECTION_LABELS
             if is_time_label or is_section_label:
                 # 翻页后日期标签可能已经靠近窗口顶部，不能只检查首屏下半区。
-                # 顶部导航也有“贴图/视频号”，专区标签只接受内容区中的同名文本。
+                # 顶部导航也有“贴图/视频号”。资料头较长时这一排会低于窗口 20%，
+                # 不能只靠高度区分；与“全部/文章”同一行的是导航，不是内容分区。
                 minimum_y = height * (0.20 if is_section_label else 0.08)
-                if row["center_y"] > minimum_y and row["left"] < width * 0.45:
+                navigation_row = is_section_label and any(
+                    other["normalized"] in {"全部", "文章"}
+                    and abs(other["center_y"] - row["center_y"]) <= max(8, height * 0.015)
+                    for other in rows
+                )
+                if (
+                    not navigation_row
+                    and row["center_y"] > minimum_y
+                    and row["left"] < width * 0.45
+                ):
                     label_ids.add(index)
                     labels.append(
                         {

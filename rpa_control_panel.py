@@ -32,12 +32,15 @@ import requests
 from bson import ObjectId
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+import pymysql
+import pymysql.cursors
 
+import db_mysql
 from env_config import load_project_env
 from runtime_diagnostics import runtime_identity
 
 
-# 必须在读取 MongoDB、管理员密码等模块级配置前加载本机 .env。
+# 必须在读取数据库、管理员密码等模块级配置前加载本机 .env。
 load_project_env()
 
 
@@ -48,12 +51,33 @@ RUN_HISTORY_PATH = RPA_DIR / "config" / "run_history.json"
 PANEL_LOG_PATH = RPA_DIR / "output" / "control-panel.log"
 PANEL_LOG_MAX_BYTES = 10 * 1024 * 1024
 RUN_HISTORY_LIMIT = 50
+
+# MySQL 配置
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "123456")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "weixin")
+MYSQL_ARTICLE_TABLE = os.getenv("MYSQL_ARTICLE_TABLE", "article")
+MYSQL_TARGET_TABLE = os.getenv("MYSQL_TARGET_TABLE", "collection_target")
+MYSQL_DAILY_REPORT_TABLE = os.getenv("MYSQL_DAILY_REPORT_TABLE", "daily_report")
+
+# 兼容保留 MongoDB 配置
 ARTICLE_MONGO_URI = os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/")
 ARTICLE_MONGO_DATABASE = os.getenv("ARTICLE_MONGO_DATABASE", "weixin")
 ARTICLE_MONGO_COLLECTION = os.getenv("ARTICLE_MONGO_COLLECTION", "article")
 TARGET_MONGO_COLLECTION = os.getenv("MONGO_TARGET_COLLECTION", "collection_target")
-# daily_news_send 生成后的编辑日报归档；团队日报只读展示，不改变其发送状态。
 DAILY_REPORT_MONGO_COLLECTION = os.getenv("DAILY_REPORT_MONGO_COLLECTION", "daily_reports")
+
+
+def _get_mysql_connection() -> pymysql.connections.Connection:
+    return db_mysql.get_mysql_connection(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+    )
 ACCOUNT_ALIASES_PATH = RPA_DIR / "config" / "account_aliases.json"
 ARTICLE_EXPORT_LIMIT = 10_000
 # MongoDB 中的 publishDate 沿用北京时间的无时区存储，因此筛选边界也必须固定为 UTC+8。
@@ -117,6 +141,7 @@ FAILURE_RECOVERY_HINTS = {
     "copy_link": "确认文章页已完全加载且微信可访问剪贴板后重试。",
     "window": "将微信“搜一搜”窗口置前并保持可见后重试。",
     "network": "检查网络连接和微信页面加载状态后重试。",
+    "mysql": "检查 MySQL 入库服务连接与唯一索引状态后重试。",
     "mongo": "检查入库服务连接与唯一索引状态后重试。",
 }
 DEFAULT_FAILURE_RECOVERY_HINT = "请保留本次输出目录的 run.log，并确认微信页面状态后重试。"
@@ -146,8 +171,8 @@ def build_collector_command(output_dir: Path, options: dict[str, Any]) -> list[s
         str(RPA_DIR / "wechat_visual_rpa.py"),
         "--run-search-accounts",
         "--live",
-        "--accounts-from-mongo",
-        "--write-mongo",
+        "--accounts-from-mysql",
+        "--write-mysql",
         "--metrics",
         str(options["metrics"]),
         "--scan-range",
@@ -195,25 +220,48 @@ def article_date_window(date_filter: str) -> tuple[datetime, datetime] | None:
 
 
 def serialize_article_item(document: dict[str, Any]) -> dict[str, Any]:
-    """Convert a Mongo article document into the small list-card payload."""
-    account = document.get("account") or {}
-    article = document.get("article") or {}
-    latest = document.get("latestInteraction") or {}
-    publish_date = article.get("publishDate")
+    """Convert an article record (MySQL row or Mongo document) into the small list-card payload."""
+    if "account" in document or "article" in document:
+        account = document.get("account") or {}
+        article = document.get("article") or {}
+        latest = document.get("latestInteraction") or {}
+        publish_date = article.get("publishDate")
+        if isinstance(publish_date, datetime):
+            publish_text = publish_date.strftime("%Y-%m-%d %H:%M")
+        else:
+            publish_text = str(publish_date or "")
+        return {
+            "id": str(document.get("_id") or document.get("id") or ""),
+            "account_name": str(account.get("name") or "未识别公众号"),
+            "title": str(article.get("title") or "未命名文章"),
+            "publish_time": publish_text,
+            "url": str(article.get("url") or ""),
+            "share_count": latest.get("shareCount"),
+            "recognition_method": str(latest.get("recognitionMethod") or ""),
+            "content_available": bool((article.get("content") or {}).get("text")),
+            "last_updated_at": _format_datetime(document.get("lastUpdatedAt") or document.get("last_updated_at")),
+        }
+
+    publish_date = document.get("publish_date")
     if isinstance(publish_date, datetime):
         publish_text = publish_date.strftime("%Y-%m-%d %H:%M")
     else:
         publish_text = str(publish_date or "")
+
+    latest_interaction = document.get("latestInteraction") or {}
+    share_count = latest_interaction.get("shareCount") if latest_interaction else document.get("latest_share_count")
+    rec_method = str(latest_interaction.get("recognitionMethod") or "")
+
     return {
-        "id": str(document.get("_id") or ""),
-        "account_name": str(account.get("name") or "未识别公众号"),
-        "title": str(article.get("title") or "未命名文章"),
+        "id": str(document.get("id") or document.get("_id") or ""),
+        "account_name": str(document.get("account_name") or "未识别公众号"),
+        "title": str(document.get("title") or "未命名文章"),
         "publish_time": publish_text,
-        "url": str(article.get("url") or ""),
-        "share_count": latest.get("shareCount"),
-        "recognition_method": str(latest.get("recognitionMethod") or ""),
-        "content_available": bool((article.get("content") or {}).get("text")),
-        "last_updated_at": _format_datetime(document.get("lastUpdatedAt")),
+        "url": str(document.get("url") or ""),
+        "share_count": share_count,
+        "recognition_method": rec_method,
+        "content_available": bool(document.get("content_text")),
+        "last_updated_at": _format_datetime(document.get("last_updated_at")),
     }
 
 
@@ -261,22 +309,47 @@ def _article_match(date_filter: str, account: str, query: str) -> dict[str, Any]
 
 def serialize_article_export_row(document: dict[str, Any]) -> dict[str, Any]:
     """将数据库文档转为便于表格分析的扁平导出行，正文与最新互动只取一次。"""
-    account = document.get("account") or {}
-    article = document.get("article") or {}
-    interaction = document.get("latestInteraction") or {}
+    if "account" in document or "article" in document:
+        account = document.get("account") or {}
+        article = document.get("article") or {}
+        interaction = document.get("latestInteraction") or {}
+        return {
+            "account_name": str(account.get("name") or "未识别公众号"),
+            "title": str(article.get("title") or "未命名文章"),
+            "publish_time": _format_datetime(article.get("publishDate")),
+            "url": str(article.get("url") or ""),
+            "content": str((article.get("content") or {}).get("text") or ""),
+            "read_count": interaction.get("readCount"),
+            "like_count": interaction.get("likeCount"),
+            "share_count": interaction.get("shareCount"),
+            "favorite_count": interaction.get("favoriteCount"),
+            "comment_count": interaction.get("commentCount"),
+            "collected_at": _format_datetime(interaction.get("collectedAt")),
+            "recognition_method": str(interaction.get("recognitionMethod") or ""),
+        }
+
+    latest_interaction = document.get("latestInteraction") or {}
+    read_count = latest_interaction.get("readCount", document.get("latest_read_count"))
+    like_count = latest_interaction.get("likeCount", document.get("latest_like_count"))
+    share_count = latest_interaction.get("shareCount", document.get("latest_share_count"))
+    favorite_count = latest_interaction.get("favoriteCount")
+    comment_count = latest_interaction.get("commentCount", document.get("latest_comment_count"))
+    collected_at = latest_interaction.get("collectedAt", document.get("latest_collected_at"))
+    rec_method = str(latest_interaction.get("recognitionMethod") or "")
+
     return {
-        "account_name": str(account.get("name") or "未识别公众号"),
-        "title": str(article.get("title") or "未命名文章"),
-        "publish_time": _format_datetime(article.get("publishDate")),
-        "url": str(article.get("url") or ""),
-        "content": str((article.get("content") or {}).get("text") or ""),
-        "read_count": interaction.get("readCount"),
-        "like_count": interaction.get("likeCount"),
-        "share_count": interaction.get("shareCount"),
-        "favorite_count": interaction.get("favoriteCount"),
-        "comment_count": interaction.get("commentCount"),
-        "collected_at": _format_datetime(interaction.get("collectedAt")),
-        "recognition_method": str(interaction.get("recognitionMethod") or ""),
+        "account_name": str(document.get("account_name") or "未识别公众号"),
+        "title": str(document.get("title") or "未命名文章"),
+        "publish_time": _format_datetime(document.get("publish_date")),
+        "url": str(document.get("url") or ""),
+        "content": str(document.get("content_text") or ""),
+        "read_count": read_count,
+        "like_count": like_count,
+        "share_count": share_count,
+        "favorite_count": favorite_count,
+        "comment_count": comment_count,
+        "collected_at": _format_datetime(collected_at),
+        "recognition_method": rec_method,
     }
 
 
@@ -341,13 +414,9 @@ def list_accounts(
     if status not in {"all", "covered", "missing", "alias"}:
         raise ValueError("账号状态必须是 all、covered、missing 或 alias")
 
+    alias_map = aliases if aliases is not None else load_account_aliases()
     client = None
-    if target_collection is None or article_collection is None:
-        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
-        database = client[ARTICLE_MONGO_DATABASE]
-        target_collection = database[TARGET_MONGO_COLLECTION]
-        article_collection = database[ARTICLE_MONGO_COLLECTION]
-    try:
+    if target_collection is not None and article_collection is not None and hasattr(article_collection, "aggregate"):
         coverage = {
             str(item.get("_id") or ""): item
             for item in article_collection.aggregate(
@@ -363,13 +432,33 @@ def list_accounts(
                 ]
             )
         }
-        # 账号量目前很小，先完整读取后再做筛选，能保证概览和分页口径一致。
         rows = list(
             target_collection.find(
                 {}, {"name": 1, "id": 1, "category": 1, "type": 1}
             ).sort("name", 1)
         )
-        alias_map = aliases if aliases is not None else load_account_aliases()
+    else:
+        conn = _get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT account_name, COUNT(*) AS article_count, MAX(publish_date) AS latest_publish "
+                    f"FROM `{MYSQL_ARTICLE_TABLE}` "
+                    "WHERE account_name IS NOT NULL AND account_name != '' "
+                    "GROUP BY account_name"
+                )
+                coverage = {
+                    str(item["account_name"]): item
+                    for item in cursor.fetchall()
+                }
+                cursor.execute(
+                    f"SELECT id, name, account_id, category, type FROM `{MYSQL_TARGET_TABLE}` ORDER BY name ASC"
+                )
+                rows = cursor.fetchall()
+        finally:
+            conn.close()
+
+    try:
         all_items = []
         for row in rows:
             name = str(row.get("name") or "未命名公众号")
@@ -378,9 +467,9 @@ def list_accounts(
             article_count = int(summary.get("article_count") or 0)
             all_items.append(
                 {
-                    "id": str(row.get("_id") or ""),
+                    "id": str(row.get("id") or row.get("_id") or ""),
                     "name": name,
-                    "source_id": str(row.get("id") or ""),
+                    "source_id": str(row.get("account_id") or row.get("id") or ""),
                     "category": str(row.get("category") or "未分类"),
                     "account_type": str(row.get("type") or "公众号"),
                     "search_name": alias or name,
@@ -443,7 +532,7 @@ def list_articles(
     offset: int = 0,
     collection: Any | None = None,
 ) -> dict[str, Any]:
-    """Read paginated articles only; this function never writes MongoDB."""
+    """Read paginated articles only; this function never writes database."""
     if not 1 <= limit <= 100:
         raise ValueError("limit 必须是 1 到 100 的整数")
     if offset < 0:
@@ -452,15 +541,9 @@ def list_articles(
         raise ValueError("排序方式必须是 publish_desc 或 share_desc")
     if minimum_share is not None and minimum_share < 0:
         raise ValueError("最低转发数必须是非负整数")
-    match = _article_match(date_filter, account, query)
 
-    client = None
-    if collection is None:
-        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
-        collection = client[ARTICLE_MONGO_DATABASE][ARTICLE_MONGO_COLLECTION]
-    try:
-        # 转发数来自最新一次互动记录，必须在提取 latestInteraction 后再筛选和计数。
-        # 否则总数会包含当前页实际不会展示的文章，分页也会失真。
+    if collection is not None and hasattr(collection, "aggregate"):
+        match = _article_match(date_filter, account, query)
         filter_pipeline = [
             {"$match": match},
             {"$addFields": {"latestInteraction": {"$arrayElemAt": ["$interactionHistory", -1]}}},
@@ -479,9 +562,53 @@ def list_articles(
         ]
         items = [serialize_article_item(item) for item in collection.aggregate(pipeline)]
         return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    conn = _get_mysql_connection()
+    try:
+        with conn.cursor() as cursor:
+            where_clauses = ["1=1"]
+            params: list[Any] = []
+
+            window = article_date_window(date_filter)
+            if window is not None:
+                start, end = window
+                where_clauses.append("publish_date >= %s AND publish_date < %s")
+                params.extend([start, end])
+
+            if account.strip():
+                where_clauses.append("account_name = %s")
+                params.append(account.strip())
+
+            if query.strip():
+                pattern = f"%{query.strip()}%"
+                where_clauses.append("(title LIKE %s OR content_text LIKE %s)")
+                params.extend([pattern, pattern])
+
+            if minimum_share is not None:
+                where_clauses.append("latest_share_count >= %s")
+                params.append(minimum_share)
+
+            where_sql = " AND ".join(where_clauses)
+            cursor.execute(f"SELECT COUNT(*) AS total FROM `{MYSQL_ARTICLE_TABLE}` WHERE {where_sql}", params)
+            total = int(cursor.fetchone()["total"])
+
+            order_by = (
+                "latest_share_count DESC, id DESC"
+                if sort == "share_desc"
+                else "publish_date DESC, id DESC"
+            )
+            cursor.execute(
+                f"SELECT id, account_id, account_name, title, publish_date, url, content_text, "
+                f"latest_share_count, latest_read_count, latest_like_count, latest_comment_count, "
+                f"latest_collected_at, last_updated_at FROM `{MYSQL_ARTICLE_TABLE}` "
+                f"WHERE {where_sql} ORDER BY {order_by} LIMIT %s OFFSET %s",
+                [*params, limit, offset],
+            )
+            rows = cursor.fetchall()
+            items = [serialize_article_item(row) for row in rows]
+            return {"items": items, "total": total, "limit": limit, "offset": offset}
     finally:
-        if client is not None:
-            client.close()
+        conn.close()
 
 
 def _daily_report_date(value: str) -> tuple[date, datetime, datetime]:
@@ -559,12 +686,7 @@ def daily_briefing(
     """读取一份已生成的编辑日报，供团队阅读页展示；全程只读。"""
     selected_day, _start, _end = _daily_report_date(issue_date)
     client = None
-    if report_collection is None:
-        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
-        report_collection = client[ARTICLE_MONGO_DATABASE][DAILY_REPORT_MONGO_COLLECTION]
-    try:
-        # 日报数量远小于文章库，读取最近归档后在内存排序能兼容不同 Mongo 驱动版本，
-        # 也便于保障“同日多次生成时取最新一份”的展示口径。
+    if report_collection is not None and hasattr(report_collection, "find"):
         reports = list(
             report_collection.find(
                 {},
@@ -580,86 +702,118 @@ def daily_briefing(
                 },
             )
         )
-        report_key = selected_day.isoformat()
-        same_day = [report for report in reports if str(report.get("reportDate") or "") == report_key]
-        same_day.sort(
-            key=lambda report: _daily_briefing_sort_time(
-                report.get("generatedAt") or report.get("createdAt")
-            ),
-            reverse=True,
-        )
-        report = same_day[0] if same_day else None
-        archive: list[dict[str, str]] = []
-        for candidate in sorted(
-            reports,
-            key=lambda item: (
-                str(item.get("reportDate") or ""),
-                _daily_briefing_sort_time(item.get("generatedAt") or item.get("createdAt")),
-            ),
-            reverse=True,
-        ):
-            date_text = str(candidate.get("reportDate") or "")
-            if not date_text or any(item["issue_date"] == date_text for item in archive):
-                continue
-            archive.append(
-                {
-                    "issue_date": date_text,
-                    "generated_at": _format_datetime(candidate.get("generatedAt") or candidate.get("createdAt")),
-                    "coverage_label": _daily_briefing_time_range(candidate)["label"],
-                }
-            )
-        if not report or not str(report.get("reportContent") or "").strip():
-            return {
-                "issue_date": report_key,
-                "issue_label": f"{selected_day.year}年{selected_day.month}月{selected_day.day}日早报",
-                "available": False,
-                "message": "该期每日新闻尚未生成。可在“文章动态”查看已采集的原始文章。",
-                "archive": archive,
-            }
-
-        articles = report.get("articles") if isinstance(report.get("articles"), list) else []
-        category_counts: dict[str, int] = {}
-        account_names: set[str] = set()
-        highlights: list[dict[str, Any]] = []
-        for article in articles:
-            if not isinstance(article, dict):
-                continue
-            category = str(article.get("category") or "未分类")
-            category_counts[category] = category_counts.get(category, 0) + 1
-            account_name = str(article.get("accountName") or "").strip()
-            if account_name:
-                account_names.add(account_name)
-            title = str(article.get("title") or "").strip()
-            if title:
-                highlights.append(
-                    {
-                        "title": title,
-                        "account_name": account_name or "未识别公众号",
-                        "url": str(article.get("url") or ""),
-                        "share_count": _daily_number(article.get("shareCount")),
-                    }
+    else:
+        conn = _get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT report_date, generated_at, created_at, time_range_start, time_range_end, "
+                    f"article_count, report_content, send_status, articles_json FROM `{MYSQL_DAILY_REPORT_TABLE}`"
                 )
-        highlights.sort(key=lambda item: (item["share_count"], item["title"]), reverse=True)
+                sql_rows = cursor.fetchall()
+                reports = []
+                for r in sql_rows:
+                    art_json = r.get("articles_json")
+                    if isinstance(art_json, str) and art_json.strip():
+                        try:
+                            art_list = json.loads(art_json)
+                        except Exception:
+                            art_list = []
+                    elif isinstance(art_json, list):
+                        art_list = art_json
+                    else:
+                        art_list = []
+                    t_start = r.get("time_range_start")
+                    t_end = r.get("time_range_end")
+                    reports.append({
+                        "reportDate": str(r.get("report_date") or ""),
+                        "generatedAt": r.get("generated_at"),
+                        "createdAt": r.get("created_at"),
+                        "timeRange": {"start": t_start, "end": t_end} if t_start or t_end else None,
+                        "articleCount": r.get("article_count"),
+                        "articles": art_list,
+                        "reportContent": r.get("report_content"),
+                        "sendStatus": r.get("send_status"),
+                    })
+        finally:
+            conn.close()
+    report_key = selected_day.isoformat()
+    same_day = [report for report in reports if str(report.get("reportDate") or "") == report_key]
+    same_day.sort(
+        key=lambda report: _daily_briefing_sort_time(
+            report.get("generatedAt") or report.get("createdAt")
+        ),
+        reverse=True,
+    )
+    report = same_day[0] if same_day else None
+    archive: list[dict[str, str]] = []
+    for candidate in sorted(
+        reports,
+        key=lambda item: (
+            str(item.get("reportDate") or ""),
+            _daily_briefing_sort_time(item.get("generatedAt") or item.get("createdAt")),
+        ),
+        reverse=True,
+    ):
+        date_text = str(candidate.get("reportDate") or "")
+        if not date_text or any(item["issue_date"] == date_text for item in archive):
+            continue
+        archive.append(
+            {
+                "issue_date": date_text,
+                "generated_at": _format_datetime(candidate.get("generatedAt") or candidate.get("createdAt")),
+                "coverage_label": _daily_briefing_time_range(candidate)["label"],
+            }
+        )
+    if not report or not str(report.get("reportContent") or "").strip():
         return {
             "issue_date": report_key,
             "issue_label": f"{selected_day.year}年{selected_day.month}月{selected_day.day}日早报",
-            "available": True,
-            "generated_at": _format_datetime(report.get("generatedAt") or report.get("createdAt")),
-            "coverage": _daily_briefing_time_range(report),
-            "article_count": _daily_number(report.get("articleCount")) or len(articles),
-            "account_count": len(account_names),
-            "send_status": str(report.get("sendStatus") or "unknown"),
-            "content": str(report.get("reportContent") or "").strip(),
-            "categories": [
-                {"name": name, "count": count}
-                for name, count in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
-            ],
-            "highlights": highlights[:5],
+            "available": False,
+            "message": "该期每日新闻尚未生成。可在“文章动态”查看已采集的原始文章。",
             "archive": archive,
         }
-    finally:
-        if client is not None:
-            client.close()
+
+    articles = report.get("articles") if isinstance(report.get("articles"), list) else []
+    category_counts: dict[str, int] = {}
+    account_names: set[str] = set()
+    highlights: list[dict[str, Any]] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        category = str(article.get("category") or "未分类")
+        category_counts[category] = category_counts.get(category, 0) + 1
+        account_name = str(article.get("accountName") or "").strip()
+        if account_name:
+            account_names.add(account_name)
+        title = str(article.get("title") or "").strip()
+        if title:
+            highlights.append(
+                {
+                    "title": title,
+                    "account_name": account_name or "未识别公众号",
+                    "url": str(article.get("url") or ""),
+                    "share_count": _daily_number(article.get("shareCount")),
+                }
+            )
+    highlights.sort(key=lambda item: (item["share_count"], item["title"]), reverse=True)
+    return {
+        "issue_date": report_key,
+        "issue_label": f"{selected_day.year}年{selected_day.month}月{selected_day.day}日早报",
+        "available": True,
+        "generated_at": _format_datetime(report.get("generatedAt") or report.get("createdAt")),
+        "coverage": _daily_briefing_time_range(report),
+        "article_count": _daily_number(report.get("articleCount")) or len(articles),
+        "account_count": len(account_names),
+        "send_status": str(report.get("sendStatus") or "unknown"),
+        "content": str(report.get("reportContent") or "").strip(),
+        "categories": [
+            {"name": name, "count": count}
+            for name, count in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))
+        ],
+        "highlights": highlights[:5],
+        "archive": archive,
+    }
 
 
 def daily_report(
@@ -675,24 +829,17 @@ def daily_report(
     requested_category = category.strip() or "all"
     requested_account = account.strip()
     client = None
-    if article_collection is None or target_collection is None:
-        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
-        database = client[ARTICLE_MONGO_DATABASE]
-        article_collection = article_collection or database[ARTICLE_MONGO_COLLECTION]
-        target_collection = target_collection or database[TARGET_MONGO_COLLECTION]
 
-    try:
+    if article_collection is not None and target_collection is not None and hasattr(article_collection, "aggregate"):
         category_by_account = {
             str(row.get("name") or "").strip(): str(row.get("category") or "未分类").strip() or "未分类"
             for row in target_collection.find({}, {"_id": 0, "name": 1, "category": 1})
             if str(row.get("name") or "").strip()
         }
-        # 仅取日报真正需要的字段，正文只截取短摘要，降低局域网访问时的传输压力。
-        # 目录页跳转时按账号过滤，仍复用同一份只读日报查询，避免团队端落回控制台。
         article_match: dict[str, Any] = {"article.publishDate": {"$gte": start, "$lt": end}}
         if requested_account:
             article_match["account.name"] = requested_account
-        documents = article_collection.aggregate(
+        documents = list(article_collection.aggregate(
             [
                 {"$match": article_match},
                 {"$addFields": {"latestInteraction": {"$arrayElemAt": ["$interactionHistory", -1]}}},
@@ -707,7 +854,45 @@ def daily_report(
                     }
                 },
             ]
-        )
+        ))
+    else:
+        conn = _get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT name, category FROM `{MYSQL_TARGET_TABLE}`")
+                category_by_account = {
+                    str(row["name"]).strip(): str(row["category"] or "未分类").strip() or "未分类"
+                    for row in cursor.fetchall()
+                    if str(row.get("name") or "").strip()
+                }
+                where_clauses = ["publish_date >= %s", "publish_date < %s"]
+                params: list[Any] = [start, end]
+                if requested_account:
+                    where_clauses.append("account_name = %s")
+                    params.append(requested_account)
+                cursor.execute(
+                    f"SELECT account_name, title, url, publish_date, content_text, latest_share_count "
+                    f"FROM `{MYSQL_ARTICLE_TABLE}` WHERE {' AND '.join(where_clauses)}",
+                    params,
+                )
+                sql_rows = cursor.fetchall()
+                documents = [
+                    {
+                        "account": {"name": row["account_name"]},
+                        "article": {
+                            "title": row["title"],
+                            "publishDate": row["publish_date"],
+                            "url": row["url"],
+                            "content": {"text": row["content_text"]},
+                        },
+                        "latestInteraction": {"shareCount": row["latest_share_count"]},
+                    }
+                    for row in sql_rows
+                ]
+        finally:
+            conn.close()
+
+    try:
 
         rows: list[dict[str, Any]] = []
         excluded_count = 0
@@ -817,12 +1002,9 @@ def article_export_rows(
         raise ValueError("排序方式必须是 publish_desc 或 share_desc")
     if minimum_share is not None and minimum_share < 0:
         raise ValueError("最低转发数必须是非负整数")
-    match = _article_match(date_filter, account, query)
-    client = None
-    if collection is None:
-        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
-        collection = client[ARTICLE_MONGO_DATABASE][ARTICLE_MONGO_COLLECTION]
-    try:
+
+    if collection is not None and hasattr(collection, "aggregate"):
+        match = _article_match(date_filter, account, query)
         pipeline = [
             {"$match": match},
             {"$addFields": {"latestInteraction": {"$arrayElemAt": ["$interactionHistory", -1]}}},
@@ -841,22 +1023,63 @@ def article_export_rows(
             ]
         )
         return [serialize_article_export_row(document) for document in documents]
+
+    conn = _get_mysql_connection()
+    try:
+        with conn.cursor() as cursor:
+            where_clauses = ["1=1"]
+            params: list[Any] = []
+
+            window = article_date_window(date_filter)
+            if window is not None:
+                start, end = window
+                where_clauses.append("publish_date >= %s AND publish_date < %s")
+                params.extend([start, end])
+
+            if account.strip():
+                where_clauses.append("account_name = %s")
+                params.append(account.strip())
+
+            if query.strip():
+                pattern = f"%{query.strip()}%"
+                where_clauses.append("(title LIKE %s OR content_text LIKE %s)")
+                params.extend([pattern, pattern])
+
+            if minimum_share is not None:
+                where_clauses.append("latest_share_count >= %s")
+                params.append(minimum_share)
+
+            where_sql = " AND ".join(where_clauses)
+            cursor.execute(f"SELECT COUNT(*) AS total FROM `{MYSQL_ARTICLE_TABLE}` WHERE {where_sql}", params)
+            total = int(cursor.fetchone()["total"])
+            if total > ARTICLE_EXPORT_LIMIT:
+                raise ValueError(f"当前条件下有 {total} 篇文章；一次最多导出 {ARTICLE_EXPORT_LIMIT} 篇，请缩小筛选范围")
+
+            order_by = (
+                "latest_share_count DESC, id DESC"
+                if sort == "share_desc"
+                else "publish_date DESC, id DESC"
+            )
+            cursor.execute(
+                f"SELECT id, account_id, account_name, title, publish_date, url, content_text, "
+                f"latest_share_count, latest_read_count, latest_like_count, latest_comment_count, "
+                f"latest_collected_at, last_updated_at FROM `{MYSQL_ARTICLE_TABLE}` "
+                f"WHERE {where_sql} ORDER BY {order_by} LIMIT %s",
+                [*params, ARTICLE_EXPORT_LIMIT],
+            )
+            rows = cursor.fetchall()
+            return [serialize_article_export_row(row) for row in rows]
     finally:
-        if client is not None:
-            client.close()
+        conn.close()
 
 
 def get_article_detail(article_id: str, collection: Any | None = None) -> dict[str, Any] | None:
     """Read a single article body for the detail drawer, without returning it in list calls."""
-    try:
-        object_id = ObjectId(article_id)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError("文章 ID 格式错误") from exc
-    client = None
-    if collection is None:
-        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
-        collection = client[ARTICLE_MONGO_DATABASE][ARTICLE_MONGO_COLLECTION]
-    try:
+    if collection is not None and hasattr(collection, "find_one"):
+        try:
+            object_id = ObjectId(article_id)
+        except Exception:
+            object_id = article_id
         document = collection.find_one({"_id": object_id})
         if document is None:
             return None
@@ -864,9 +1087,53 @@ def get_article_detail(article_id: str, collection: Any | None = None) -> dict[s
         item["content"] = str(((document.get("article") or {}).get("content") or {}).get("text") or "")
         item["interaction"] = document.get("interactionHistory", [])[-1] if document.get("interactionHistory") else {}
         return item
+
+    normalized_id = str(article_id or "").strip()
+    if not normalized_id or len(normalized_id) > 64:
+        raise ValueError("文章 ID 格式错误")
+
+    conn = _get_mysql_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM `{MYSQL_ARTICLE_TABLE}` WHERE id = %s LIMIT 1",
+                (normalized_id,),
+            )
+            document = cursor.fetchone()
+            if document is None:
+                return None
+            item = serialize_article_item(document)
+            item["content"] = str(document.get("content_text") or "")
+            cursor.execute(
+                "SELECT collected_at, recognition_method, source, share_count, read_count, like_count, favorite_count, comment_count "
+                "FROM article_interaction_history WHERE article_id = %s ORDER BY collected_at ASC",
+                (normalized_id,),
+            )
+            history_rows = cursor.fetchall()
+            if history_rows:
+                last = history_rows[-1]
+                item["interaction"] = {
+                    "collectedAt": _format_datetime(last.get("collected_at")),
+                    "recognitionMethod": str(last.get("recognition_method") or ""),
+                    "source": str(last.get("source") or ""),
+                    "shareCount": last.get("share_count"),
+                    "readCount": last.get("read_count"),
+                    "likeCount": last.get("like_count"),
+                    "favoriteCount": last.get("favorite_count"),
+                    "commentCount": last.get("comment_count"),
+                }
+            elif document.get("interaction_history_json"):
+                raw = document["interaction_history_json"]
+                try:
+                    hist = json.loads(raw) if isinstance(raw, str) else raw
+                    item["interaction"] = hist[-1] if hist else {}
+                except Exception:
+                    item["interaction"] = {}
+            else:
+                item["interaction"] = {}
+            return item
     finally:
-        if client is not None:
-            client.close()
+        conn.close()
 
 
 def _write_json_atomically(path: Path, payload: Any) -> None:
@@ -939,37 +1206,54 @@ def normalize_account_payload(row: dict[str, Any]) -> dict[str, str]:
     return normalized
 
 
-def _account_collections() -> tuple[Any, Any, MongoClient]:
-    """打开账号配置和文章集合；调用方必须在 finally 中关闭 client。"""
-    client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
-    database = client[ARTICLE_MONGO_DATABASE]
-    return database[TARGET_MONGO_COLLECTION], database[ARTICLE_MONGO_COLLECTION], client
+def _account_collections() -> tuple[Any, Any, Any]:
+    """打开账号配置和文章集合（兼容历史接口）；优先返回 MySQL 连接。"""
+    try:
+        conn = _get_mysql_connection()
+        return None, None, conn
+    except Exception:
+        client = MongoClient(ARTICLE_MONGO_URI, serverSelectionTimeoutMS=5000)
+        database = client[ARTICLE_MONGO_DATABASE]
+        return database[TARGET_MONGO_COLLECTION], database[ARTICLE_MONGO_COLLECTION], client
 
 
 def account_export_rows(
     *, target_collection: Any | None = None, aliases: dict[str, str] | None = None
 ) -> list[dict[str, str]]:
     """导出可回导的账号配置行，记录 ID 用来避免同名账号被误更新。"""
-    client = None
-    if target_collection is None:
-        target_collection, _article_collection, client = _account_collections()
-    try:
-        alias_map = aliases if aliases is not None else load_account_aliases()
+    alias_map = aliases if aliases is not None else load_account_aliases()
+    if target_collection is not None and hasattr(target_collection, "find"):
         rows = target_collection.find({}, {"name": 1, "id": 1, "category": 1, "type": 1}).sort("name", 1)
         return [
             {
-                "record_id": str(row.get("_id") or ""),
+                "record_id": str(row.get("_id") or row.get("id") or ""),
                 "name": str(row.get("name") or ""),
-                "source_id": str(row.get("id") or ""),
+                "source_id": str(row.get("id") or row.get("account_id") or ""),
                 "category": str(row.get("category") or "未分类"),
                 "account_type": str(row.get("type") or "公众号"),
                 "search_name": alias_map.get(str(row.get("name") or ""), str(row.get("name") or "")),
             }
             for row in rows
         ]
+
+    conn = _get_mysql_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"SELECT id, name, account_id, category, type FROM `{MYSQL_TARGET_TABLE}` ORDER BY name ASC")
+            rows = cursor.fetchall()
+            return [
+                {
+                    "record_id": str(row.get("id") or ""),
+                    "name": str(row.get("name") or ""),
+                    "source_id": str(row.get("account_id") or ""),
+                    "category": str(row.get("category") or "未分类"),
+                    "account_type": str(row.get("type") or "公众号"),
+                    "search_name": alias_map.get(str(row.get("name") or ""), str(row.get("name") or "")),
+                }
+                for row in rows
+            ]
     finally:
-        if client is not None:
-            client.close()
+        conn.close()
 
 
 def serialize_account_export_csv(rows: list[dict[str, str]]) -> str:
@@ -1005,9 +1289,9 @@ def parse_account_import(content: str, import_format: str) -> list[dict[str, Any
 
 
 def _existing_account_rows(target_collection: Any) -> dict[str, dict[str, Any]]:
-    """用字符串化的 ObjectId 建立索引，导入预览与写入共用同一识别规则。"""
+    """用字符串化的唯一ID建立索引，导入预览与写入共用同一识别规则。"""
     return {
-        str(row.get("_id") or ""): row
+        str(row.get("_id") or row.get("id") or ""): row
         for row in target_collection.find({}, {"name": 1, "id": 1, "category": 1, "type": 1})
     }
 
@@ -1016,55 +1300,63 @@ def preview_account_import(
     rows: list[dict[str, Any]], *, target_collection: Any | None = None, article_collection: Any | None = None
 ) -> dict[str, Any]:
     """给导入提供确定的新增/更新预览；有错误时不允许批量应用。"""
-    client = None
-    if target_collection is None or article_collection is None:
-        target_collection, article_collection, client = _account_collections()
-    try:
+    if target_collection is not None and hasattr(target_collection, "find"):
         existing = _existing_account_rows(target_collection)
-        preview: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        seen_names: set[str] = set()
-        for index, row in enumerate(rows, start=2):
-            try:
-                item = normalize_account_payload(row)
-                record_id = item["record_id"]
-                if record_id and record_id in seen_ids:
-                    raise ValueError("记录ID重复")
-                seen_ids.add(record_id)
-                if item["name"] in seen_names:
-                    raise ValueError("公众号名称重复")
-                seen_names.add(item["name"])
-                current = existing.get(record_id) if record_id else None
-                if record_id and current is None:
-                    raise ValueError("记录ID不存在，不能更新未知账号")
-                same_name = next(
-                    (candidate for candidate in existing.values() if str(candidate.get("name") or "") == item["name"]),
-                    None,
-                )
-                if same_name and not current:
-                    raise ValueError("已存在同名公众号，请使用导出文件中的记录ID更新")
-                if same_name and current and same_name is not current:
-                    raise ValueError("公众号名称已被其他账号使用")
-                if current and item["name"] != str(current.get("name") or ""):
-                    # 改名会切断历史文章 account.name 的归属，因此必须走专门的数据迁移流程。
-                    if article_collection.count_documents({"account.name": current.get("name")}) > 0:
-                        raise ValueError("已有入库文章的公众号不能直接改名，请保留公众号名称并修改采集搜索名")
-                action = "更新" if current else "新增"
-                preview.append({"line": index, "status": "valid", "action": action, "item": item})
-            except ValueError as exc:
-                preview.append({"line": index, "status": "error", "message": str(exc)})
-        return {
-            "items": preview,
-            "summary": {
-                "total": len(preview),
-                "create": sum(1 for item in preview if item.get("action") == "新增"),
-                "update": sum(1 for item in preview if item.get("action") == "更新"),
-                "error": sum(1 for item in preview if item["status"] == "error"),
-            },
-        }
-    finally:
-        if client is not None:
-            client.close()
+        def article_count_fn(name: str) -> int:
+            return article_collection.count_documents({"account.name": name}) if article_collection else 0
+    else:
+        conn = _get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT id, name, account_id, category, type FROM `{MYSQL_TARGET_TABLE}`")
+                existing = {str(row["id"]): row for row in cursor.fetchall()}
+                cursor.execute(f"SELECT account_name, COUNT(*) AS cnt FROM `{MYSQL_ARTICLE_TABLE}` GROUP BY account_name")
+                art_counts = {str(r["account_name"]): int(r["cnt"]) for r in cursor.fetchall()}
+                def article_count_fn(name: str) -> int:
+                    return art_counts.get(name, 0)
+        finally:
+            conn.close()
+
+    preview: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for index, row in enumerate(rows, start=2):
+        try:
+            item = normalize_account_payload(row)
+            record_id = item["record_id"]
+            if record_id and record_id in seen_ids:
+                raise ValueError("记录ID重复")
+            seen_ids.add(record_id)
+            if item["name"] in seen_names:
+                raise ValueError("公众号名称重复")
+            seen_names.add(item["name"])
+            current = existing.get(record_id) if record_id else None
+            if record_id and current is None:
+                raise ValueError("记录ID不存在，不能更新未知账号")
+            same_name = next(
+                (candidate for candidate in existing.values() if str(candidate.get("name") or "") == item["name"]),
+                None,
+            )
+            if same_name and not current:
+                raise ValueError("已存在同名公众号，请使用导出文件中的记录ID更新")
+            if same_name and current and same_name is not current:
+                raise ValueError("公众号名称已被其他账号使用")
+            if current and item["name"] != str(current.get("name") or ""):
+                if article_count_fn(current.get("name", "")) > 0:
+                    raise ValueError("已有入库文章的公众号不能直接改名，请保留公众号名称并修改采集搜索名")
+            action = "更新" if current else "新增"
+            preview.append({"line": index, "status": "valid", "action": action, "item": item})
+        except ValueError as exc:
+            preview.append({"line": index, "status": "error", "message": str(exc)})
+    return {
+        "items": preview,
+        "summary": {
+            "total": len(preview),
+            "create": sum(1 for item in preview if item.get("action") == "新增"),
+            "update": sum(1 for item in preview if item.get("action") == "更新"),
+            "error": sum(1 for item in preview if item["status"] == "error"),
+        },
+    }
 
 
 def upsert_account_config(
@@ -1075,18 +1367,16 @@ def upsert_account_config(
     aliases: dict[str, str] | None = None,
     persist_aliases: bool = True,
 ) -> dict[str, Any]:
-    """新增或编辑一条采集账号，且只写 collection_target 与本地别名文件。"""
+    """新增或编辑一条采集账号，且只写数据库目标表与本地别名文件。"""
     item = normalize_account_payload(row)
-    client = None
-    if target_collection is None or article_collection is None:
-        target_collection, article_collection, client = _account_collections()
-    try:
+
+    if target_collection is not None and hasattr(target_collection, "find"):
         existing = _existing_account_rows(target_collection)
         current = existing.get(item["record_id"]) if item["record_id"] else None
         if item["record_id"] and current is None:
             raise ValueError("记录ID不存在，无法保存")
         if current and item["name"] != str(current.get("name") or ""):
-            if article_collection.count_documents({"account.name": current.get("name")}) > 0:
+            if article_collection and article_collection.count_documents({"account.name": current.get("name")}) > 0:
                 raise ValueError("已有入库文章的公众号不能直接改名，请仅修改采集搜索名")
         document = {"name": item["name"], "id": item["source_id"], "category": item["category"], "type": item["account_type"]}
         if current:
@@ -1094,26 +1384,57 @@ def upsert_account_config(
             record_id = str(current["_id"])
             old_name = str(current.get("name") or "")
         else:
-            duplicate = next((row for row in existing.values() if str(row.get("name") or "") == item["name"]), None)
+            duplicate = next((r for r in existing.values() if str(r.get("name") or "") == item["name"]), None)
             if duplicate:
                 raise ValueError("已存在同名公众号，请使用编辑操作")
             result = target_collection.insert_one(document)
             record_id = str(result.inserted_id)
             old_name = ""
+    else:
+        conn = _get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT id, name, account_id, category, type FROM `{MYSQL_TARGET_TABLE}`")
+                targets = cursor.fetchall()
+                existing = {str(r["id"]): r for r in targets}
+                current = existing.get(item["record_id"]) if item["record_id"] else None
+                if item["record_id"] and current is None:
+                    raise ValueError("记录ID不存在，无法保存")
+                if current and item["name"] != str(current.get("name") or ""):
+                    cursor.execute(f"SELECT COUNT(*) AS cnt FROM `{MYSQL_ARTICLE_TABLE}` WHERE account_name = %s", (current["name"],))
+                    if cursor.fetchone()["cnt"] > 0:
+                        raise ValueError("已有入库文章的公众号不能直接改名，请仅修改采集搜索名")
 
-        alias_map = aliases if aliases is not None else load_account_aliases()
-        if old_name and old_name != item["name"]:
-            alias_map.pop(old_name, None)
-        if item["search_name"] == item["name"]:
-            alias_map.pop(item["name"], None)
-        else:
-            alias_map[item["name"]] = item["search_name"]
-        if persist_aliases:
-            _write_json_atomically(ACCOUNT_ALIASES_PATH, alias_map)
-        return {"record_id": record_id, "action": "updated" if current else "created", "item": {**item, "record_id": record_id}}
-    finally:
-        if client is not None:
-            client.close()
+                if current:
+                    cursor.execute(
+                        f"UPDATE `{MYSQL_TARGET_TABLE}` SET name = %s, account_id = %s, category = %s, type = %s WHERE id = %s",
+                        (item["name"], item["source_id"], item["category"], item["account_type"], current["id"]),
+                    )
+                    record_id = str(current["id"])
+                    old_name = str(current.get("name") or "")
+                else:
+                    dup = next((r for r in targets if str(r.get("name") or "") == item["name"]), None)
+                    if dup:
+                        raise ValueError("已存在同名公众号，请使用编辑操作")
+                    record_id = db_mysql.generate_object_id()
+                    cursor.execute(
+                        f"INSERT INTO `{MYSQL_TARGET_TABLE}` (id, account_id, name, category, type) VALUES (%s, %s, %s, %s, %s)",
+                        (record_id, item["source_id"], item["name"], item["category"], item["account_type"]),
+                    )
+                    old_name = ""
+        finally:
+            conn.close()
+
+    alias_map = aliases if aliases is not None else load_account_aliases()
+    if old_name and old_name != item["name"]:
+        alias_map.pop(old_name, None)
+    if item["search_name"] == item["name"]:
+        alias_map.pop(item["name"], None)
+    else:
+        alias_map[item["name"]] = item["search_name"]
+    if persist_aliases:
+        _write_json_atomically(ACCOUNT_ALIASES_PATH, alias_map)
+    return {"record_id": record_id, "action": "updated" if current else "created", "item": {**item, "record_id": record_id}}
 
 
 def delete_account_config(
@@ -1124,33 +1445,44 @@ def delete_account_config(
     aliases: dict[str, str] | None = None,
     persist_aliases: bool = True,
 ) -> dict[str, Any]:
-    """从采集名单移除一个公众号。只删 collection_target 和本地搜索别名，不删已入库文章。"""
+    """从采集名单移除一个公众号。只删目标账号表和本地搜索别名，不删已入库文章。"""
     normalized_id = str(record_id or "").strip()
     if not normalized_id:
         raise ValueError("缺少公众号记录ID")
     if len(normalized_id) > 80:
         raise ValueError("记录ID不能超过 80 个字符")
-    client = None
-    if target_collection is None or article_collection is None:
-        target_collection, article_collection, client = _account_collections()
-    try:
+
+    if target_collection is not None and hasattr(target_collection, "find"):
         current = _existing_account_rows(target_collection).get(normalized_id)
         if current is None:
             raise ValueError("公众号不存在或已经删除")
         name = str(current.get("name") or "")
-        # 只读取文章数量，用来告诉操作者历史文章仍在；这里没有任何文章删除调用。
-        articles_kept = int(article_collection.count_documents({"account.name": name})) if name else 0
+        articles_kept = int(article_collection.count_documents({"account.name": name})) if name and article_collection else 0
         deleted = target_collection.delete_one({"_id": current["_id"]})
         if getattr(deleted, "deleted_count", 0) != 1:
             raise ValueError("公众号不存在或已经删除")
-        alias_map = aliases if aliases is not None else load_account_aliases()
-        alias_map.pop(name, None)
-        if persist_aliases:
-            _write_json_atomically(ACCOUNT_ALIASES_PATH, alias_map)
-        return {"record_id": normalized_id, "name": name, "articles_kept": articles_kept}
-    finally:
-        if client is not None:
-            client.close()
+    else:
+        conn = _get_mysql_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT id, name FROM `{MYSQL_TARGET_TABLE}` WHERE id = %s", (normalized_id,))
+                current = cursor.fetchone()
+                if current is None:
+                    raise ValueError("公众号不存在或已经删除")
+                name = str(current.get("name") or "")
+                articles_kept = 0
+                if name:
+                    cursor.execute(f"SELECT COUNT(*) AS cnt FROM `{MYSQL_ARTICLE_TABLE}` WHERE account_name = %s", (name,))
+                    articles_kept = int(cursor.fetchone()["cnt"])
+                cursor.execute(f"DELETE FROM `{MYSQL_TARGET_TABLE}` WHERE id = %s", (normalized_id,))
+        finally:
+            conn.close()
+
+    alias_map = aliases if aliases is not None else load_account_aliases()
+    alias_map.pop(name, None)
+    if persist_aliases:
+        _write_json_atomically(ACCOUNT_ALIASES_PATH, alias_map)
+    return {"record_id": normalized_id, "name": name, "articles_kept": articles_kept}
 
 
 class RunHistory:
@@ -2083,11 +2415,16 @@ class ControlState:
                     self.add_log("error", f"飞书抓取启动失败告警发送失败：{exc}")
                 return False, message
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            output_dir = RPA_DIR / "output" / f"mongo-{stamp}"
+            output_dir = RPA_DIR / "output" / f"mysql-{stamp}"
             output_dir.mkdir(parents=True, exist_ok=True)
             command = build_collector_command(output_dir, options)
             environment = os.environ.copy()
-            environment.setdefault("MONGO_URI", "mongodb://192.168.28.70:27019/")
+            environment.setdefault("MYSQL_HOST", MYSQL_HOST)
+            environment.setdefault("MYSQL_PORT", str(MYSQL_PORT))
+            environment.setdefault("MYSQL_USER", MYSQL_USER)
+            environment.setdefault("MYSQL_PASSWORD", MYSQL_PASSWORD)
+            environment.setdefault("MYSQL_DATABASE", MYSQL_DATABASE)
+            environment.setdefault("MONGO_URI", ARTICLE_MONGO_URI)
             # 子进程日志统一使用 UTF-8，避免中文账号在管理页面中显示为乱码。
             environment["PYTHONIOENCODING"] = "utf-8"
             creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -2528,7 +2865,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     )
                 else:
                     raise ValueError("导出格式仅支持 csv 或 json")
-            except PyMongoError as exc:
+            except (pymysql.MySQLError, PyMongoError) as exc:
                 # 数据库连接/认证异常也必须返回 JSON，前端才能展示可处理的原因。
                 self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
@@ -2545,7 +2882,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     offset=max(0, int(query.get("offset", ["0"])[0])),
                 )
                 self._json({"ok": True, **result})
-            except PyMongoError as exc:
+            except (pymysql.MySQLError, PyMongoError) as exc:
                 self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取公众号失败：{exc}"}, HTTPStatus.BAD_REQUEST)
@@ -2560,7 +2897,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     account=str(query.get("account", [""])[0]),
                 )
                 self._json({"ok": True, **result})
-            except PyMongoError as exc:
+            except (pymysql.MySQLError, PyMongoError) as exc:
                 self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取日报失败：{exc}"}, HTTPStatus.BAD_REQUEST)
@@ -2570,7 +2907,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
             try:
                 issue_date = str(query.get("date", [beijing_today().isoformat()])[0])
                 self._json({"ok": True, **daily_briefing(issue_date=issue_date)})
-            except PyMongoError as exc:
+            except (pymysql.MySQLError, PyMongoError) as exc:
                 self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取每日新闻失败：{exc}"}, HTTPStatus.BAD_REQUEST)
@@ -2592,7 +2929,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     offset=max(0, int(query.get("offset", ["0"])[0])),
                 )
                 self._json({"ok": True, **result})
-            except PyMongoError as exc:
+            except (pymysql.MySQLError, PyMongoError) as exc:
                 self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取文章失败：{exc}"}, HTTPStatus.BAD_REQUEST)
@@ -2619,7 +2956,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     )
                 else:
                     raise ValueError("导出格式仅支持 csv 或 json")
-            except PyMongoError as exc:
+            except (pymysql.MySQLError, PyMongoError) as exc:
                 self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"导出文章失败：{exc}"}, HTTPStatus.BAD_REQUEST)
@@ -2632,7 +2969,7 @@ class ControlHandler(SimpleHTTPRequestHandler):
                     self._json({"ok": False, "message": "未找到文章"}, HTTPStatus.NOT_FOUND)
                 else:
                     self._json({"ok": True, "item": item})
-            except PyMongoError as exc:
+            except (pymysql.MySQLError, PyMongoError) as exc:
                 self._json({"ok": False, "message": f"数据服务暂时不可用：{exc}"}, HTTPStatus.SERVICE_UNAVAILABLE)
             except (ValueError, OSError) as exc:
                 self._json({"ok": False, "message": f"读取文章详情失败：{exc}"}, HTTPStatus.BAD_REQUEST)

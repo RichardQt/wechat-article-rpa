@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 $venvPath = Join-Path $PSScriptRoot ".venv"
@@ -83,7 +83,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to install dependencies. Review the network, proxy, and package index settings."
 }
 
-& $venvPython -c "import cv2, pymongo, onnxruntime; from rapidocr_onnxruntime import RapidOCR; print('Environment check passed')"
+& $venvPython -c "import cv2, pymysql, pymongo, onnxruntime; from rapidocr_onnxruntime import RapidOCR; print('Environment check passed')"
 if ($LASTEXITCODE -ne 0) {
     throw "Dependency verification failed. Review the error above."
 }

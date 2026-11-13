@@ -43,7 +43,48 @@ class DirectNavigationTests(unittest.TestCase):
         nav.on_closed = forgotten.append
         with self.assertRaisesRegex(RuntimeError, "基线不一致"):
             nav.restore(self.before)
+        self.assertEqual(self.closed, 1)
         self.assertEqual(forgotten, [])
+
+    def test_lingering_closed_tab_is_reread_without_closing_again(self):
+        """关闭后的第一次探测仍看见旧标签时，只等待下一次读取，不再关一次。"""
+        tabs = self.tabs
+        current = self.article
+        active = (3,)
+        closes = 0
+        observes_after_close = 0
+        settled = False
+
+        def observe():
+            nonlocal observes_after_close, tabs, current, active, settled
+            if closes:
+                observes_after_close += 1
+                if observes_after_close >= 2 and not settled:
+                    settled = True
+                    tabs = self.tabs[:2]
+                    current, active = self.search, (1,)
+            return current
+
+        def close():
+            nonlocal closes
+            closes += 1
+
+        def select(identity):
+            nonlocal current, active
+            self.assertEqual(identity, (2,))
+            current, active = self.profile, identity
+            return True
+
+        nav = Navigator(observe, lambda: self.fail("正常路径不得遍历"), close,
+                        lambda: self.fail("新标签不得后退"),
+                        signature=lambda: tabs, selected=lambda: active, select_tab=select)
+        forgotten = []
+        nav.on_closed = forgotten.append
+        self.assertEqual(nav.restore(self.before), "new_tab")
+        self.assertEqual(closes, 1)
+        self.assertGreaterEqual(observes_after_close, 2)
+        self.assertEqual(forgotten, [self.article])
+        self.assertEqual(current, self.profile)
 
     def test_unknown_multiple_changes_and_missing_selected_reject_fast_path(self):
         nav = self.navigator()

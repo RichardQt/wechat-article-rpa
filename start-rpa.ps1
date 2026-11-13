@@ -8,7 +8,7 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$outputDir = Join-Path $PSScriptRoot "output\mongo-$stamp"
+$outputDir = Join-Path $PSScriptRoot "output\mysql-$stamp"
 
 Write-Host "Confirm that WeChat is logged in and the Search window is visible." -ForegroundColor Yellow
 Write-Host "Do not use the mouse or keyboard while the RPA is running." -ForegroundColor Yellow
@@ -23,8 +23,8 @@ $arguments = @(
     "-u", (Join-Path $PSScriptRoot "wechat_visual_rpa.py"),
     "--run-search-accounts",
     "--live",
-    "--accounts-from-mongo",
-    "--write-mongo",
+    "--accounts-from-mysql",
+    "--write-mysql",
     "--metrics", "share",
     "--window-layout", "auto",
     "--max-articles", "20",

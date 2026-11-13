@@ -11,6 +11,7 @@ import difflib
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -27,7 +28,7 @@ from pymongo import MongoClient
 from env_config import load_project_env
 from wechat_window_probe import has_search_tab, probe_page, select_tab
 from runtime_diagnostics import runtime_identity
-from browser_navigation import Navigator, Page, Checkpoint, InventoryCache, tab_signature, selected_tab, page_from_probe, feed_from_probe, picture_share_count
+from browser_navigation import Navigator, Page, Checkpoint, InventoryCache, tab_signature, selected_tab, page_from_probe, feed_from_probe, picture_share_count, is_loading_title
 from network_metrics import read_snapshot
 from tab_ownership import TabOwnership
 
@@ -78,6 +79,25 @@ ACCOUNT_ALIASES_PATH = RPA_DIR / "config" / "account_aliases.json"
 COPY_LINK_POSITION_CACHE_PATH = Path(
     os.getenv("RPA_COPY_LINK_CACHE_PATH", str(RPA_DIR / "config" / "ui_position_cache.json"))
 )
+
+
+def _env_seconds_range(name: str, default: tuple[float, float]) -> tuple[float, float]:
+    """读取「最少-最多」秒数配置；单个数字表示固定值，格式不对时使用默认值。"""
+    raw = os.getenv(name, "").strip()
+    try:
+        values = [float(part) for part in raw.split("-", 1)] if raw else []
+    except ValueError:
+        values = []
+    if not values or values[0] < 0 or values[-1] < values[0]:
+        return default
+    return values[0], values[-1]
+
+
+# 点击和翻篇节奏都在区间内随机取值，避免固定高频的机械操作触发微信风控。
+CLICK_INTERVAL_SECONDS = _env_seconds_range("RPA_CLICK_INTERVAL_SECONDS", (0.8, 1.5))
+ARTICLE_PAUSE_SECONDS = _env_seconds_range("RPA_ARTICLE_PAUSE_SECONDS", (3.0, 6.0))
+ACCOUNT_PAUSE_SECONDS = _env_seconds_range("RPA_ACCOUNT_PAUSE_SECONDS", (8.0, 15.0))
+_LAST_CLICK_AT = 0.0
 FEED_OCR = WeChatFeedOCR()
 INTERACTION_OCR = InteractionOCR()
 PROFILE_OCR = WeChatProfileOCR()
@@ -252,8 +272,13 @@ def validate_cached_menu_button_action(
         cached_y = int(cached["center_y_1000"])
     except (KeyError, TypeError, ValueError):
         return {"found": False, "reason": "菜单按钮缓存坐标格式错误"}
-    if not (450 <= cached_x <= 980 and 0 <= cached_y <= 120):
+    if not (180 <= cached_x <= 980 and 0 <= cached_y <= 120):
         return {"found": False, "reason": "菜单按钮缓存坐标不在浏览器顶部工具栏内"}
+    summary_left = PROFILE_OCR.summary_button_left(screenshot)
+    if summary_left is not None:
+        cached_px = screenshot.size[0] * cached_x / 1000
+        if cached_px >= summary_left - 4:
+            return {"found": False, "reason": "菜单按钮缓存落在总结按钮上"}
 
     detected = PROFILE_OCR.locate_browser_menu_button(screenshot)
     if detected.get("found"):
@@ -274,6 +299,7 @@ def validate_cached_menu_button_action(
         "confidence": float(cached.get("confidence") or 1.0),
         "method": "cached-menu-button-verified-position",
         "live_detection_found": bool(detected.get("found")),
+        "live_detection": detected if detected.get("found") else None,
     }
 
 
@@ -310,8 +336,8 @@ def normalize_qwen_menu_button_action(result: dict[str, Any]) -> dict[str, Any]:
         confidence = float(result.get("confidence") or 0)
     except (KeyError, TypeError, ValueError):
         return {"found": False, "reason": "Qwen-VL 菜单按钮坐标格式错误"}
-    # 菜单按钮必须位于文章窗口标题栏右侧，防止选择正文或页面内的省略号。
-    if not (450 <= x_1000 <= 950 and 0 <= y_1000 <= 140) or confidence < 0.80:
+    # 三个点现在位于当前标签标题旁，不能再限制在窗口最右侧。
+    if not (180 <= x_1000 <= 950 and 0 <= y_1000 <= 140) or confidence < 0.80:
         return {"found": False, "reason": "Qwen-VL 菜单按钮位置越界或置信度不足"}
     return {
         "found": True,
@@ -360,6 +386,28 @@ def resolve_search_account_name(account_name: str) -> str:
         return account_name
     alias = raw.get(account_name)
     return alias.strip() if isinstance(alias, str) and alias.strip() else account_name
+
+
+SERVICE_ACCOUNT_NAMES: set[str] = {
+    "我的南京官方号",
+    *(
+        item.strip()
+        for item in os.getenv("WECHAT_SERVICE_ACCOUNTS", "").split(",")
+        if item.strip()
+    ),
+}
+
+
+def resolve_secondary_filter_name(account_name: str, search_name: str = "") -> str:
+    """返回搜一搜“账号”分类下的二级筛选项名称。
+
+    默认选中“公众号”；当公众号名称为“我的南京官方号”（或配置在 WECHAT_SERVICE_ACCOUNTS 中）时选中“服务号”。
+    """
+    clean_account = account_name.strip()
+    clean_search = search_name.strip()
+    if clean_account in SERVICE_ACCOUNT_NAMES or (clean_search and clean_search in SERVICE_ACCOUNT_NAMES):
+        return "服务号"
+    return "公众号"
 
 
 def configure_run_logging(output_dir: Path) -> Path:
@@ -818,7 +866,7 @@ def browser_navigator(window: WindowInfo, account: str) -> Navigator:
         identity = bindings.get(page.key, ())
         return identity if identity in dict(signature) else ()
 
-    def choose_tab(identity: tuple) -> bool:
+    def choose_tab(identity: tuple, allow_icon_tab: bool = False) -> bool:
         activate_window(window.hwnd)
         observe()
         if evidence.get("tab_probe_mode") != "custom-unverified":
@@ -827,10 +875,17 @@ def browser_navigator(window: WindowInfo, account: str) -> Navigator:
         if len(matches) != 1 or matches[0].get("offscreen"):
             return False
         left, top, right, bottom = matches[0]["rect"]
-        if right - left < 60 or bottom - top < 10:
+        if bottom - top < 10:
             return False
-        # 使用刚读取的标签实体位置，点击左侧标题区，避开右侧关闭按钮。
-        click(round(left + (right-left) * 0.3), round((top+bottom)/2))
+        if right - left >= 60:
+            # 使用刚读取的标签实体位置，点击左侧标题区，避开右侧关闭按钮。
+            x = round(left + (right-left) * 0.3)
+        elif allow_icon_tab and right - left >= 16:
+            # 标签多时未激活标签被压成图标，没有关闭按钮，点图标中心即可。
+            x = round((left + right) / 2)
+        else:
+            return False
+        click(x, round((top+bottom)/2))
         time.sleep(0.4)
         page = observe()
         if page.key and identity in dict(tab_signature(evidence)):
@@ -880,28 +935,44 @@ def browser_navigator(window: WindowInfo, account: str) -> Navigator:
         user32.keybd_event(0x12, 0, 2, 0)
         time.sleep(0.8)
 
+    def pause() -> None:
+        # 只在关闭后的标签快照尚未回到基线时调用，给微信标签树一次刷新时间。
+        time.sleep(0.4)
+
     return Navigator(observe, next_tab, close_tab, back,
                      signature=lambda: tab_signature(evidence), cache=cache,
                      selected=current_tab, select_tab=choose_tab,
                      custom_tabs=lambda: evidence.get("tab_probe_mode") == "custom-unverified",
+                     pause=pause,
                      on_reused=lambda old, new: TAB_OWNERSHIP.reuse(session, old, new),
                      on_created=lambda page: TAB_OWNERSHIP.remember(session, page),
                      on_closed=lambda page: TAB_OWNERSHIP.forget(session, page),
                      trace=lambda data: log_event("browser_navigation", account=account, **data))
 
 
-def wait_for_article_page(window: WindowInfo, account: str, title: str, timeout: float = 15) -> Page:
-    """网页文档会先出现空壳，再更新标题和署名；等待身份齐全后才能采集或清理。"""
+def wait_for_article_page(window: WindowInfo, account: str, title: str, timeout: float = 20) -> Page:
+    """网页文档会先出现空壳，再更新标题和署名；等待身份齐全后才能采集或清理。
+
+    正文和署名常常先于标题渲染，此时文档名仍是「微信公众平台」占位名。
+    网络慢时占位要好几秒才换成真实标题，它不是标题不匹配，只能继续等。
+    """
     deadline = time.monotonic() + timeout
     page = Page(window.hwnd, "", "unknown", "")
     mismatch_key, mismatch_count = "", 0
+    loading_logged = False
     while time.monotonic() < deadline:
         page = observe_browser_page(window, account)
         if page.role in {"article", "unknown"} and page.name and titles_match(title, page.name):
             # 非标准图文可能没有 UIA 日期/署名。此处仅允许进入读取链路，
             # collect_open_article 仍须校验链接解析出的标题、公众号和前后 URL。
             return page
-        if page.role == "article" and page.name:
+        if is_loading_title(page.name):
+            if not loading_logged:
+                loading_logged = True
+                log_event("article_page_title_loading", account=account, expected_title=title,
+                          observed_page=page.__dict__)
+            mismatch_key, mismatch_count = "", 0
+        elif page.role == "article" and page.name:
             mismatch_count = mismatch_count + 1 if page.key == mismatch_key else 1
             mismatch_key = page.key
             if mismatch_count >= 3:
@@ -947,6 +1018,58 @@ def recover_batch_navigation(account_name: str) -> None:
     if not browser_navigator(browser, "").select(lambda page: page.role == "search"):
         raise RuntimeError("未找到可确认的搜一搜页面")
     log_event("batch_navigation_recovered", account=account_name)
+
+
+_BATCH_BASELINE_TABS: dict[str, frozenset] = {}
+
+
+def close_batch_leftover_tabs(window: WindowInfo, account_name: str) -> int:
+    """开始新公众号前，把本批次打开后没能关掉的公众号页签清回批次开始时的数量。
+
+    标签一多，微信把未激活标签压成图标，当前标签的三点和菜单随之左移，后续
+    公众号会连锁失败。只关闭批次开始后才出现、且确认是公众号主页或文章的页签；
+    搜一搜和批次开始前已有的页签不动。证据不足时停止清理，不阻断本公众号。
+    """
+    session = browser_session(window.hwnd)
+    if not session:
+        return 0
+    navigator = browser_navigator(window, "")
+    navigator.observe()
+    tabs = [identity for identity, _name in navigator.signature()]
+    if not tabs:
+        return 0
+    baseline = _BATCH_BASELINE_TABS.setdefault(session, frozenset(tabs))
+    leftovers = [identity for identity in tabs if identity not in baseline]
+    if not leftovers:
+        return 0
+    log_event("browser_leftover_tabs_found", account=account_name,
+              baseline_tab_count=len(baseline), current_tab_count=len(tabs))
+    closed, reason = 0, ""
+    for identity in reversed(leftovers):
+        if not navigator.select_tab(identity, allow_icon_tab=True):
+            reason = "无法选中残留页签"
+            break
+        page = navigator.observe()
+        if page.role not in {"article", "profile"}:
+            reason = f"残留页签不是公众号主页或文章：{page.name or page.role}"
+            break
+        before = {tab for tab, _name in navigator.signature()}
+        navigator.close_tab()
+        after: set = set()
+        for _ in range(3):
+            navigator.observe()
+            after = {tab for tab, _name in navigator.signature()}
+            if after and after != before:
+                break
+            navigator.pause()
+        if not after or before - after != {identity} or after - before:
+            reason = "关闭后页签变化与预期不一致"
+            break
+        TAB_OWNERSHIP.forget(session, page)
+        closed += 1
+    log_event("browser_leftover_tabs_closed", account=account_name, closed=closed,
+              remaining=len(leftovers) - closed, stopped_reason=reason or None)
+    return closed
 
 
 def close_window(hwnd: int, timeout_seconds: float = 3.0) -> None:
@@ -1468,10 +1591,22 @@ def normalized_to_screen(
     return round(window_rect.left + x), round(window_rect.top + y)
 
 
+def human_pause(seconds_range: tuple[float, float]) -> None:
+    time.sleep(random.uniform(*seconds_range))
+
+
 def click(screen_x: int, screen_y: int) -> None:
+    """与上次点击保持随机间隔，移到目标后稍停再按下，按住片刻再抬起。"""
+    global _LAST_CLICK_AT
+    remaining = random.uniform(*CLICK_INTERVAL_SECONDS) - (time.monotonic() - _LAST_CLICK_AT)
+    if remaining > 0:
+        time.sleep(remaining)
     user32.SetCursorPos(screen_x, screen_y)
+    time.sleep(random.uniform(0.06, 0.15))
     user32.mouse_event(0x0002, 0, 0, 0, 0)
+    time.sleep(random.uniform(0.04, 0.10))
     user32.mouse_event(0x0004, 0, 0, 0, 0)
+    _LAST_CLICK_AT = time.monotonic()
 
 
 def press_ctrl_shift_r() -> None:
@@ -1608,7 +1743,7 @@ def scroll_window_up(rect: Rect, wheel_notches: int = 2) -> None:
     # Qt 会把超大的单次 delta 仍按一次滚轮处理，因此必须逐次发送标准 120 delta。
     for _ in range(wheel_notches):
         user32.mouse_event(0x0800, 0, 0, 120, 0)  # MOUSEEVENTF_WHEEL
-        time.sleep(0.02)
+        time.sleep(random.uniform(0.05, 0.12))
 
 
 def scroll_window_down(rect: Rect, wheel_notches: int = 2) -> None:
@@ -1616,7 +1751,7 @@ def scroll_window_down(rect: Rect, wheel_notches: int = 2) -> None:
     user32.SetCursorPos(rect.left + rect.width // 2, rect.top + rect.height * 3 // 4)
     for _ in range(wheel_notches):
         user32.mouse_event(0x0800, 0, 0, -120, 0)
-        time.sleep(0.02)
+        time.sleep(random.uniform(0.05, 0.12))
 
 
 # 单屏最多约 4 张卡片。固定滚 2 格时，12 屏几乎还停在同一批文章上。
@@ -1743,25 +1878,18 @@ def copy_article_url(
 ) -> str:
     """动态定位浏览器菜单与“复制链接”，并用剪贴板 URL 验证整条操作链。"""
     clipboard_sentinel = f"__WECHAT_RPA_COPY_PENDING_{phase}__"
-    # 标题栏按钮的物理像素会随 Windows DPI 缩放：100% 时菜单距右侧约 124px，
-    # 150% 时约 186px。使用窗口真实 DPI，避免把 150% 坐标误用到 100% 电脑。
     get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
     dpi = int(get_dpi_for_window(hwnd)) if get_dpi_for_window else 96
     dpi = dpi if dpi > 0 else 96
     scale = dpi / 96
-    fallback_menu_action = {
-        "found": True,
-        "center_x_1000": round((rect.width - 124 * scale) * 1000 / rect.width),
-        "center_y_1000": round(21 * scale * 1000 / rect.height),
-        "confidence": 0.35,
-        "method": "dpi-relative-menu-button-fallback",
-    }
 
     # 先在菜单关闭状态下识别标题栏按钮，避免菜单遮罩干扰三点图标检测。
     press_escape()
     time.sleep(0.2)
     titlebar_screenshot = capture_window(rect)
     menu_button_action: dict[str, Any] | None = None
+    # 标签数量变化后三点会跟着当前标签移动。缓存位置打不开菜单时，本次就改点实时识别到的三点。
+    live_menu_button: dict[str, Any] | None = None
     cached_menu_button = load_menu_button_position_cache(rect, dpi)
     if cached_menu_button is not None:
         validated_menu_button = validate_cached_menu_button_action(
@@ -1771,6 +1899,7 @@ def copy_article_url(
         log_event("menu_button_cached_position_validation", phase=phase, **validated_menu_button)
         if validated_menu_button.get("found"):
             menu_button_action = validated_menu_button
+            live_menu_button = validated_menu_button.get("live_detection")
         else:
             clear_menu_button_position_cache(
                 str(validated_menu_button.get("reason") or "缓存菜单按钮验证失败")
@@ -1794,9 +1923,9 @@ def copy_article_url(
             menu_button_action = qwen_menu_button
 
     if menu_button_action is None:
-        # 最终兜底仍是 DPI 相对位置，但只有后续成功复制出公众号 URL 时才会写入缓存。
-        menu_button_action = fallback_menu_action
-        log_event("menu_button_dpi_fallback", phase=phase, **fallback_menu_action)
+        # 旧的窗口右缘固定坐标现在会落在「总结 由元宝提供」上，找不到标签三点时直接停止。
+        press_escape()
+        raise RuntimeError("未定位到文章标签上的三点菜单，已避免点击「总结 由元宝提供」")
 
     def open_menu(stage: str) -> Image.Image:
         # Esc 同时负责收起旧菜单和误弹出的“发送给”窗口，再打开干净菜单。
@@ -1888,6 +2017,12 @@ def copy_article_url(
     local_action = PROFILE_OCR.locate_copy_link_action(menu_screenshot)
     last_action = local_action
     log_event("copy_link_menu_detection", phase=phase, stage="local-ocr", **local_action)
+    if not local_action.get("found") and live_menu_button:
+        menu_button_action = live_menu_button
+        menu_screenshot = open_menu("live-menu-button")
+        local_action = PROFILE_OCR.locate_copy_link_action(menu_screenshot)
+        last_action = local_action
+        log_event("copy_link_menu_detection", phase=phase, stage="live-menu-button", **local_action)
     if local_action.get("found"):
         last_url = click_action(local_action, "local-ocr")
         if last_url.startswith("https://mp.weixin.qq.com/"):
@@ -2142,7 +2277,15 @@ def collect_open_article(
                 mongo_database or os.getenv("MONGO_DATABASE", "weixin"),
                 mongo_collection or os.getenv("MONGO_ARTICLE_COLLECTION", "article"),
             )
-            if cached_page:
+            if cached_page and expected_title and not titles_match(expected_title, cached_page["title"]):
+                log_event(
+                    "article_cached_title_mismatch_refetch",
+                    url=url,
+                    expected_title=expected_title,
+                    cached_title=cached_page.get("title"),
+                )
+                cached_page = None
+            elif cached_page:
                 log_event("article_page_reused_from_mongo", url=url)
         except Exception as exc:
             log_event("article_cache_lookup_failed", url=url, error=str(exc))
@@ -2366,9 +2509,9 @@ def classify_collection_error(error: BaseException) -> str:
         return "article_identity"
     if "搜一搜连续" in text and "未出现搜一搜" in text:
         return "search_recovery"
-    if "未找到可确认的同名公众号" in text or "没有精确匹配名称" in text:
+    if "未找到可确认的同名" in text or "没有精确匹配名称" in text:
         return "account_not_found"
-    if "筛选未确认选中" in text or "二级公众号筛选" in text:
+    if "筛选未确认选中" in text or "二级公众号筛选" in text or "二级服务号筛选" in text:
         return "account_filter"
     if "资料窗口顶部名称不匹配" in text:
         return "profile_validation"
@@ -2719,6 +2862,10 @@ def search_and_open_profile(
         closed = TAB_OWNERSHIP.cleanup(session, browser_navigator(search_window, ""))
         _CLEANED_TAB_SESSIONS.add(session)
         log_event("owned_tabs_cleanup", closed=closed)
+    try:
+        close_batch_leftover_tabs(search_window, account_name)
+    except Exception as exc:
+        log_event("browser_leftover_tabs_cleanup_failed", account=account_name, error=str(exc))
     # 新版搜索页不保证是首标签，先按页面身份定位，禁止重排用户标签。
     semantic_search = browser_navigator(search_window, "").select(lambda page: page.role == "search")
     if not semantic_search:
@@ -2838,13 +2985,16 @@ def search_and_open_profile(
             f"连续3次点击后仍无法确认账号分类已选中：{selection.get('reason', '')}"
         )
 
-    # 一级“账号”选中后，还必须明确点击二级“公众号”，不能停留在默认“不限”。
-    official_filter = PROFILE_OCR.locate_official_account_filter(screenshot)
+    # 一级“账号”选中后，还必须明确点击二级“公众号”（若账号为“我的南京官方号”则点击“服务号”），不能停留在默认“不限”。
+    secondary_filter_name = resolve_secondary_filter_name(account_name, search_name)
+    official_filter = PROFILE_OCR.locate_official_account_filter(
+        screenshot, filter_name=secondary_filter_name
+    )
     (output_dir / "official-account-filter-detection.json").write_text(
         json.dumps(official_filter, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     if not official_filter.get("found"):
-        raise RuntimeError(str(official_filter.get("reason") or "无法定位二级公众号筛选项"))
+        raise RuntimeError(str(official_filter.get("reason") or f"无法定位二级{secondary_filter_name}筛选项"))
 
     target: dict[str, Any] = {"found": False}
     official_filter_confirmed = False
@@ -2860,11 +3010,19 @@ def search_and_open_profile(
         time.sleep(1.2)
         screenshot = capture_window(search_window.rect)
         screenshot.save(output_dir / f"official-account-filter-after-{filter_attempt}.png")
-        filter_selection = PROFILE_OCR.validate_official_account_filter_selected(screenshot)
-        target = PROFILE_OCR.locate_search_result(screenshot, search_name)
+        filter_selection = PROFILE_OCR.validate_official_account_filter_selected(
+            screenshot, filter_name=secondary_filter_name
+        )
+        target = PROFILE_OCR.locate_search_result(
+            screenshot,
+            search_name,
+            filter_name=secondary_filter_name,
+            filter_confirmed=bool(filter_selection.get("selected")),
+        )
         log_event(
             "official_account_filter_validation",
             account=account_name,
+            filter_name=secondary_filter_name,
             attempt=filter_attempt,
             selected=bool(filter_selection.get("selected")),
             foreground_median=filter_selection.get("foreground_median"),
@@ -2884,14 +3042,15 @@ def search_and_open_profile(
             break
 
     if not official_filter_confirmed and filter_selected_once and allow_vl and client is not None:
-        # “账号 → 公众号”已经本地确认后，才允许 Qwen-VL 复核名称卡片。这里没有任何盲点分类标签的逻辑，
+        # “账号 → 公众号/服务号”已经本地确认后，才允许 Qwen-VL 复核名称卡片。这里没有任何盲点分类标签的逻辑，
         # 模型只用来解决本地 OCR 已经连续三次未能读出精确名称的情形。
-        local_reason = str(target.get("reason") or "本地 OCR 未能确认公众号卡片")
+        local_reason = str(target.get("reason") or f"本地 OCR 未能确认{secondary_filter_name}卡片")
         log_event(
             "vl_fallback_requested",
             stage="profile_search_result",
             account=account_name,
             search_name=search_name,
+            filter_name=secondary_filter_name,
             local_attempts=3,
             reason=local_reason,
         )
@@ -2919,10 +3078,10 @@ def search_and_open_profile(
         # 被误报为“筛选没有点上”，使人工排查走错方向。
         if not filter_selected_once:
             raise RuntimeError(
-                f"二级公众号筛选未确认选中：{filter_failure_reason}"
+                f"二级{secondary_filter_name}筛选未确认选中：{filter_failure_reason}"
             )
         raise RuntimeError(
-            "公众号筛选已选中，但未找到可确认的同名公众号："
+            f"{secondary_filter_name}筛选已选中，但未找到可确认的同名{secondary_filter_name}："
             f"{search_name}。{target.get('reason') or '名称或账号类型校验未通过'}"
         )
 
@@ -2939,7 +3098,7 @@ def search_and_open_profile(
         json.dumps(target, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     if not target.get("found"):
-        raise RuntimeError(str(target.get("reason") or "搜一搜没有精确匹配公众号"))
+        raise RuntimeError(str(target.get("reason") or f"搜一搜没有精确匹配{secondary_filter_name}"))
 
     # 保留用户已有资料窗口；新主页必须通过目标名称与页面结构验证。
     activate_window(search_window.hwnd)
@@ -3468,7 +3627,9 @@ def is_past_scan_range(value: str, scan_range: str) -> bool:
     或昨天即停止，不依赖「星期三」这类具体文字。
     """
     text = unicodedata.normalize("NFKC", value or "").strip()
-    if not text or text == "置顶":
+    # 「贴图」「视频号」是栏目，不是更早的日期。导航被识别成栏目后若据此停扫，
+    # 同一屏里排在它下面的「昨天」文章会整批被跳过。
+    if not text or text in {"置顶", "贴图", "视频号"}:
         return False
     if "今天" in text or re.fullmatch(r"\d{1,2}:\d{2}", text):
         return False
@@ -3971,6 +4132,8 @@ def collect_profile_account(
                     article_target = None
                     owned_article_window = False
                     baseline_hwnds = set()
+                    if opened_count > 1 or article_attempt > 1:
+                        human_pause(ARTICLE_PAUSE_SECONDS)
                     try:
                         log_event(
                             "article_open_attempt",
@@ -4291,6 +4454,8 @@ def load_account_names(
     mongo_uri: str = "",
     mongo_database: str = "weixin",
     mongo_collection: str = "collection_target",
+    accounts_from_mysql: bool = False,
+    mysql_table: str = "collection_target",
 ) -> list[str]:
     values = [name.strip() for name in names if name.strip()]
     if accounts_file:
@@ -4299,22 +4464,47 @@ def load_account_names(
             line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         )
-    if accounts_from_mongo:
-        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=8000)
-        try:
-            client.admin.command("ping")
-            cursor = client[mongo_database][mongo_collection].find(
-                {"name": {"$type": "string", "$ne": ""}},
-                {"_id": 1, "name": 1},
-            ).sort("_id", 1)
-            # collection_target 的 name 是采集入口；id 缺失不影响按名称搜索。
-            values.extend(
-                str(document.get("name") or "").strip()
-                for document in cursor
-                if str(document.get("name") or "").strip()
-            )
-        finally:
-            client.close()
+    if accounts_from_mysql or accounts_from_mongo:
+        loaded = False
+        if accounts_from_mysql or not (mongo_uri and mongo_uri.startswith("mongodb://")):
+            try:
+                import db_mysql
+                conn = db_mysql.get_mysql_connection()
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            f"SELECT name, type FROM `{mysql_table}` WHERE name IS NOT NULL AND name != '' ORDER BY id ASC"
+                        )
+                        for doc in cursor.fetchall():
+                            name = str(doc.get("name") or "").strip()
+                            acct_type = str(doc.get("type") or "").strip()
+                            if name:
+                                values.append(name)
+                                if acct_type == "服务号":
+                                    SERVICE_ACCOUNT_NAMES.add(name)
+                        loaded = True
+                finally:
+                    conn.close()
+            except Exception:
+                loaded = False
+        if not loaded and accounts_from_mongo and mongo_uri.startswith("mongodb://"):
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=8000)
+            try:
+                client.admin.command("ping")
+                cursor = client[mongo_database][mongo_collection].find(
+                    {"name": {"$type": "string", "$ne": ""}},
+                    {"_id": 1, "name": 1, "type": 1},
+                ).sort("_id", 1)
+                # collection_target 的 name 是采集入口；id 缺失不影响按名称搜索。
+                for document in cursor:
+                    name = str(document.get("name") or "").strip()
+                    acct_type = str(document.get("type") or "").strip()
+                    if name:
+                        values.extend([name])
+                        if acct_type == "服务号":
+                            SERVICE_ACCOUNT_NAMES.add(name)
+            finally:
+                client.close()
     # 保留配置顺序并去重。
     return list(dict.fromkeys(values))
 
@@ -4337,9 +4527,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--account-name", action="append", default=[], help="要搜索的公众号名称，可重复传入")
     parser.add_argument("--accounts-file", help="每行一个公众号名称的 UTF-8 文本文件")
     parser.add_argument(
+        "--accounts-from-mysql",
+        action="store_true",
+        help="从MySQL的collection_target.name读取公众号名称",
+    )
+    parser.add_argument(
         "--accounts-from-mongo",
         action="store_true",
-        help="从MongoDB的collection_target.name读取公众号名称",
+        help="从MongoDB/MySQL的collection_target.name读取公众号名称",
     )
     parser.add_argument(
         "--accounts-mongo-uri",
@@ -4379,7 +4574,8 @@ def parse_args() -> argparse.Namespace:
         default="today_yesterday",
         help="文章日期范围：today 今天、yesterday 昨天、today_yesterday 今天和昨天",
     )
-    parser.add_argument("--write-mongo", action="store_true", help="允许将采集结果写入MongoDB")
+    parser.add_argument("--write-mysql", action="store_true", help="允许将采集结果写入MySQL")
+    parser.add_argument("--write-mongo", action="store_true", help="允许将采集结果写入数据库(兼容别名)")
     parser.add_argument(
         "--article-mongo-uri",
         default=os.getenv("MONGO_URI", "mongodb://192.168.28.70:27019/"),
@@ -4416,6 +4612,10 @@ def main() -> None:
               cache_directory=os.getenv("WECHAT_CAPTURE_CACHE_DIR", ""),
               metric_mode=args.metrics,
               note="配置启用不代表代理已连通，以实际响应命中为准")
+    log_event("interaction_pacing_configuration",
+              click_interval_seconds=CLICK_INTERVAL_SECONDS,
+              article_pause_seconds=ARTICLE_PAUSE_SECONDS,
+              account_pause_seconds=ACCOUNT_PAUSE_SECONDS)
     if args.local_only:
         # 严格本地模式不要求配置 API Key，且所有可能调用 VL 的分支都会被禁止。
         client = QwenVisionClient(QwenVisionConfig(base_url="", api_key=""))
@@ -4432,6 +4632,8 @@ def main() -> None:
     if args.run_search_accounts:
         if not args.live:
             raise RuntimeError("搜索采集模式必须显式传入 --live")
+        from_mysql = args.accounts_from_mysql or (args.accounts_from_mongo and not args.accounts_mongo_uri.startswith("mongodb://"))
+        should_write_db = args.write_mysql or args.write_mongo
         account_names = load_account_names(
             args.account_name,
             args.accounts_file,
@@ -4439,17 +4641,18 @@ def main() -> None:
             mongo_uri=args.accounts_mongo_uri,
             mongo_database=args.accounts_mongo_database,
             mongo_collection=args.accounts_mongo_collection,
+            accounts_from_mysql=from_mysql,
         )
         if not account_names:
             raise RuntimeError(
-                "请通过 --account-name、--accounts-file 或 --accounts-from-mongo 提供公众号名称"
+                "请通过 --account-name、--accounts-file 或 --accounts-from-mysql 提供公众号名称"
             )
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         (Path(args.output_dir) / "accounts-source.json").write_text(
             json.dumps(
                 {
                     "count": len(account_names),
-                    "source": "mongo" if args.accounts_from_mongo else "arguments_or_file",
+                    "source": "mysql" if from_mysql else ("mongo" if args.accounts_from_mongo else "arguments_or_file"),
                     "mongo_database": args.accounts_mongo_database if args.accounts_from_mongo else None,
                     "mongo_collection": args.accounts_mongo_collection if args.accounts_from_mongo else None,
                     "accounts": account_names,
@@ -4463,10 +4666,12 @@ def main() -> None:
         log_event(
             "accounts_loaded",
             count=len(account_names),
-            source="mongo" if args.accounts_from_mongo else "arguments_or_file",
+            source="mysql" if from_mysql else ("mongo" if args.accounts_from_mongo else "arguments_or_file"),
         )
         summaries = []
-        for account_name in account_names:
+        for account_index, account_name in enumerate(account_names):
+            if account_index:
+                human_pause(ACCOUNT_PAUSE_SECONDS)
             account_output_dir = Path(args.output_dir) / safe_path_name(account_name)
             try:
                 collector = (
@@ -4482,7 +4687,7 @@ def main() -> None:
                     args.export_jsonl or None,
                     args.export_csv or None,
                     allow_vl=vl_available,
-                    write_mongo=args.write_mongo,
+                    write_mongo=should_write_db,
                     mongo_uri=args.article_mongo_uri,
                     mongo_database=args.article_mongo_database,
                     mongo_collection=args.article_mongo_collection,

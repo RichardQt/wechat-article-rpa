@@ -288,6 +288,7 @@ function failureRecoveryHint(category) {
     copy_link: "确认文章页已完全加载且微信可访问剪贴板后重试。",
     window: "将微信“搜一搜”窗口置前并保持可见后重试。",
     network: "检查网络连接和微信页面加载状态后重试。",
+    mysql: "检查 MySQL 入库服务连接与唯一索引状态后重试。",
     mongo: "检查入库服务连接与唯一索引状态后重试。",
   };
   return hints[category] || "请保留本次输出目录的 run.log，并确认微信页面状态后重试。";

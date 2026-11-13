@@ -11,7 +11,7 @@
       <header class="topbar">
         <div>
           <h1>文章管理</h1>
-          <p>查看已写入 MongoDB 的文章与最新转发数据。</p>
+          <p>查看已写入 MySQL 的文章与最新转发数据。</p>
         </div>
         <a class="back-link" href="/">返回控制台</a>
       </header>
@@ -37,7 +37,7 @@
       </section>
 
       <section class="article-results" aria-labelledby="articleResultTitle">
-        <div class="article-results-head"><div><h2 id="articleResultTitle">文章列表</h2><p id="articleResultSummary">正在读取今天的文章…</p></div><div class="article-result-actions"><span class="data-badge">只读 MongoDB</span><button class="text-button" id="exportArticles" type="button">导出文章</button></div></div>
+        <div class="article-results-head"><div><h2 id="articleResultTitle">文章列表</h2><p id="articleResultSummary">正在读取今天的文章…</p></div><div class="article-result-actions"><span class="data-badge">只读 MySQL</span><button class="text-button" id="exportArticles" type="button">导出文章</button></div></div>
         <div id="articleList" class="article-list" aria-live="polite"></div>
         <div class="article-pagination"><button class="text-button" id="previousPage" type="button">上一页</button><span id="pageText">第 1 页</span><button class="text-button" id="nextPage" type="button">下一页</button></div>
       </section>

@@ -79,6 +79,31 @@ class AccountTabSelectionTests(unittest.TestCase):
         self.assertFalse(result["selected"])
         self.assertEqual(result["reason"], "账号下划线或账号结果证据未确认")
 
+    def test_locate_service_account_filter(self) -> None:
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+        ocr._rows = lambda _image: _account_rows()
+        image = Image.new("RGB", (1000, 1000), "white")
+        result = ocr.locate_official_account_filter(image, filter_name="服务号")
+        self.assertTrue(result["found"])
+        self.assertEqual(result["ocr_text"], "服务号")
+        # index=3: left=290, right=350, center=320 -> center_x_1000=320
+        self.assertEqual(result["center_x_1000"], 320)
+        self.assertEqual(result["center_y_1000"], 265)
+
+    def test_validate_service_account_filter_selected(self) -> None:
+        ocr = WeChatProfileOCR.__new__(WeChatProfileOCR)
+        ocr._rows = lambda _image: _account_rows()
+        # index=3: left=290, right=350, top=250, bottom=280
+        dark_image = Image.new("RGB", (1000, 1000), "white")
+        ImageDraw.Draw(dark_image).rectangle((290, 250, 350, 280), fill=(20, 20, 20))
+        selected_result = ocr.validate_official_account_filter_selected(dark_image, filter_name="服务号")
+        self.assertTrue(selected_result["selected"])
+
+        light_image = Image.new("RGB", (1000, 1000), "white")
+        unselected_result = ocr.validate_official_account_filter_selected(light_image, filter_name="服务号")
+        self.assertFalse(unselected_result["selected"])
+        self.assertIn("服务号文字仍为未选中的浅色", unselected_result["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,23 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
+# 微信内置浏览器写入文章标题前，文档名先显示为这个占位名。
+LOADING_PAGE_TITLES = frozenset({"微信公众平台"})
+
+
+def is_loading_title(name: str) -> bool:
+    return normalize(name) in LOADING_PAGE_TITLES
+
+
+def title_finished_loading(before: "Page", after: "Page") -> bool:
+    """占位名换成真实标题后 key 会变，但文档、窗口、角色和账号都不变。"""
+    document = before.key.split(":", 1)[0]
+    return (is_loading_title(before.name) and not is_loading_title(after.name)
+            and document not in {"", "[]"} and after.key.split(":", 1)[0] == document
+            and (before.hwnd, before.role, normalize(before.account))
+            == (after.hwnd, after.role, normalize(after.account)))
+
+
 def picture_share_count(data: dict, account: str, title: str) -> int | None:
     """图片消息使用文字互动栏；限定正文末尾和账号，排除评论及推荐卡片。"""
     for doc in data.get("documents", []):
@@ -273,7 +290,8 @@ class Navigator:
                  cache: InventoryCache | None = None,
                  selected: Callable[[], tuple] | None = None,
                  select_tab: Callable[[tuple], bool] | None = None,
-                 custom_tabs: Callable[[], bool] | None = None):
+                 custom_tabs: Callable[[], bool] | None = None,
+                 pause: Callable[[], None] | None = None):
         self.observe = observe
         self.next_tab = next_tab
         self.close_tab = close_tab
@@ -288,6 +306,17 @@ class Navigator:
         self.selected = selected or (lambda: ())
         self.select_tab = select_tab or (lambda identity: False)
         self.custom_tabs = custom_tabs or (lambda: False)
+        self.pause = pause or (lambda: None)
+        self.settle_limit = 12
+
+    def settle(self, page: Page) -> Page:
+        """占位名期间同一文档会先后出现两个 key；等真实标题写入后再建立身份或关闭。"""
+        for _ in range(self.settle_limit):
+            if not is_loading_title(page.name):
+                break
+            self.pause()
+            page = self.observe()
+        return page
 
     def confirm_added(self, before: Checkpoint, current: Page) -> bool:
         if self.added_target(before, current):
@@ -303,9 +332,12 @@ class Navigator:
         # 自定义标签没有 selected 状态：直接选择唯一新增标签，并再次核对文档。
         # 这一步不离开目标文章，也不把“新增”直接等同于当前活动页。
         target = next(iter(added))
-        if not self.select_tab(target) or self.observe() != current:
+        if not self.select_tab(target):
             raise RuntimeError("直接选择新增标签后页面身份不一致，已停止导航")
-        return self.added_target(before, current)
+        selected = self.observe()
+        if selected != current and not title_finished_loading(current, selected):
+            raise RuntimeError("直接选择新增标签后页面身份不一致，已停止导航")
+        return self.added_target(before, selected)
 
     def added_target(self, before: Checkpoint, current: Page) -> bool:
         """仅唯一新增的目标标签可走快速路径；复用、替换和不完整证据回退。"""
@@ -350,7 +382,7 @@ class Navigator:
                         origin_tab=before.origin_tab, selected_tab=selected))
 
     def track_created(self, before: Checkpoint) -> None:
-        current = self.observe()
+        current = self.settle(self.observe())
         if self.confirm_added(before, current):
             self.on_created(current)
             self.cache_added(before, current)
@@ -416,18 +448,37 @@ class Navigator:
                 return False
         raise RuntimeError("标签遍历超过上限，无法确认浏览器状态")
 
+    def await_closed_baseline(self, before: Checkpoint, restored: Page) -> Page:
+        """关闭指令已经发出。微信自定义标签会晚约一秒才从无障碍树消失。
+
+        这段时间只重新读取。再发一次关闭可能关掉公众号主页或搜一搜。
+        """
+        for attempt in range(1, 4):
+            current_tabs = self.signature()
+            if current_tabs == before.tabs:
+                if attempt > 1:
+                    self.trace({"stage": "restore_direct_settled", "attempt": attempt,
+                                "tab_count": len(before.tabs)})
+                return restored
+            if attempt == 3:
+                break
+            self.trace({"stage": "restore_direct_wait", "attempt": attempt,
+                        "baseline_tab_count": len(before.tabs),
+                        "current_tab_count": len(current_tabs)})
+            self.pause()
+            restored = self.observe()
+        raise RuntimeError("关闭后标签列表与基线不一致，保留归属记录并停止")
+
     def restore(self, before: Checkpoint) -> str:
-        current = self.observe()
+        current = self.settle(self.observe())
         if current == before.origin:
             return "unchanged"
         if self.confirm_added(before, current):
             added = self.selected()
             self.on_created(current)
             self.close_tab()
-            restored = self.observe()
             # 关闭后标签集必须精确回到基线，不能只因为窗口切走就宣称关闭成功。
-            if self.signature() != before.tabs:
-                raise RuntimeError("关闭后标签列表与基线不一致，保留归属记录并停止")
+            restored = self.await_closed_baseline(before, self.observe())
             if self.selected() != before.origin_tab:
                 if not self.select_tab(before.origin_tab):
                     # 直接选择不受支持时才有界搜索，绝不再关闭一次。

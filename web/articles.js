@@ -64,7 +64,7 @@ async function openArticle(id) {
   } catch (error) {
     // 抽屉内直接说明失败原因；仅弹 Toast 很容易在几秒后消失，用户无法判断是否需要重试。
     const message = error.message || "读取文章详情失败";
-    elements.drawerContent.textContent = `无法读取文章详情：${message}\n\n请确认 MongoDB 服务可连接后重试。`;
+    elements.drawerContent.textContent = `无法读取文章详情：${message}\n\n请确认 MySQL 服务可连接后重试。`;
     toast(message);
   }
 }

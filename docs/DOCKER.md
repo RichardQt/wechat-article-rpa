@@ -1,99 +1,111 @@
-# Docker MongoDB 部署
+# Docker MySQL 部署
 
-Docker 只承载 MongoDB。微信客户端、视觉采集器、OCR 和控制台仍然运行在 Windows 交互式桌面中，不能放进 Linux 容器。
+Docker 容器用于承载 MySQL 服务端存储。微信客户端、视觉采集器、OCR 和控制台仍然运行在 Windows 交互式桌面中，不能放入 Linux 容器。
 
-## 一键启动
+## 一键启动与管理
 
 确认 Docker Desktop 已启动：
 
-    docker version
-    docker compose version
+```powershell
+docker version
+docker compose version
+```
 
-在项目根目录执行：
+在项目根目录使用 `mysql.bat` 快捷脚本管理：
 
-    .\mongodb.bat setup
-    .\mongodb.bat start
-    .\mongodb.bat status
+```powershell
+# 启动 MySQL 容器并等待健康检查就绪
+.\mysql.bat start
 
-setup 会生成被 Git 忽略的 .env.mongo，包含两套随机密码：
+# 查看容器运行状态
+.\mysql.bat status
 
-- mongo_root：仅用于容器初始化与健康检查；
-- wechat_rpa：仅拥有 weixin 数据库的 readWrite 权限，采集器使用此账号。
+# 查看 MySQL 容器日志
+.\mysql.bat logs
 
-控制台启动脚本会自动读取 .env.mongo，因此通常不需要再手工设置 MONGO_URI。
+# 显示连接配置信息
+.\mysql.bat connection
 
-## 默认网络
+# 停止容器（保留数据卷）
+.\mysql.bat stop
+```
 
-    127.0.0.1:27019 -> 容器 27017
+也可以直接通过 PowerShell 传参执行：
 
-默认 27019 是为了避免与开发电脑已有的 27017 MongoDB 冲突。如果需要修改，只编辑本地 .env.mongo：
+```powershell
+.\mysql.ps1 -Action start
+.\mysql.ps1 -Action status
+```
 
-    MONGO_BIND_IP=127.0.0.1
-    MONGO_PORT=27020
+## 默认网络与端口
 
-修改端口后执行：
+```text
+127.0.0.1:3306 -> 容器 3306
+```
 
-    .\mongodb.bat stop
-    .\mongodb.bat start
+如需修改绑定端口或主机地址，在项目根目录的 `.env` 文件中设置：
 
-不要把未启用来源限制的 MongoDB 暴露到公网。若采集器与 MongoDB 不在同一台机器，设置 MONGO_BIND_IP=0.0.0.0 后，还必须通过防火墙只允许采集虚拟机 IP 访问。
+```ini
+MYSQL_BIND_IP=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_ROOT_PASSWORD=your_strong_password
+MYSQL_DATABASE=weixin
+MYSQL_USER=wechat_rpa
+MYSQL_PASSWORD=your_strong_password
+```
+
+修改后重启容器生效：
+
+```powershell
+.\mysql.bat stop
+.\mysql.bat start
+```
+
+> [!IMPORTANT]
+> 切勿将无防火墙保护或使用默认弱密码的 MySQL 端口暴露到公网。若采集器与 MySQL 不在同一台机器，绑定 `0.0.0.0` 时必须在防火墙设置仅允许特定采集虚拟机 IP 访问。
 
 ## 数据持久化
 
-MongoDB 数据保存在 Docker 命名卷：
+MySQL 数据保存在 Docker 命名卷中：
 
-    wechat_article_mongo_data
+```text
+wechat-article-rpa_mysql_data
+```
 
-执行 mongodb.bat stop 只删除容器网络，不删除数据卷。不要运行以下命令，除非明确要永久清空全部数据：
-
-    docker compose --env-file .env.mongo down --volumes
+执行 `.\mysql.bat stop` 只会停止容器，不会删除数据卷。除非需要永久清空数据，否则切勿执行带 `--volumes` 的清空命令。
 
 ## 备份
 
-    .\mongodb.bat backup
+运行以下命令自动在容器内执行 `mysqldump` 并将 SQL 文件导出至宿主机：
+
+```powershell
+.\mysql.bat backup
+```
 
 备份文件保存在：
 
-    output\mongodb-backups\weixin-YYYYMMDD-HHMMSS.archive.gz
+```text
+output\mysql-backups\weixin-YYYYMMDD-HHMMSS.sql
+```
 
-output 已被 Git 忽略，备份不会进入代码仓库。请把重要备份复制到另一块磁盘或备份服务器。
+`output` 目录已被 Git 忽略，备份不会进入代码仓库。
 
 ## 恢复
 
-恢复会覆盖备份中存在的同名集合，所以要求 -Force：
+恢复操作会覆盖目标数据库中的同名数据表，需要附加 `-Force` 开关二次确认：
 
-    .\mongodb.ps1 restore -BackupFile .\output\mongodb-backups\weixin-20260803-120000.archive.gz -Force
+```powershell
+.\mysql.ps1 -Action restore -BackupFile .\output\mysql-backups\weixin-20261109-120000.sql -Force
+```
 
-恢复前建议再执行一次 backup，并确保没有采集任务正在运行。
+恢复前建议先执行一次备份，并确保当前没有采集任务正在向数据库写入。
 
-## 初始化脚本的执行时机
+## 容器初始化机制
 
-docker/mongo-init.js 只会在 MongoDB 数据卷第一次创建时执行。它负责：
+`docker/mysql-init.sql` 会在容器初次创建数据卷时由 MySQL 官方镜像自动加载执行，负责：
 
-- 创建 wechat_rpa 应用账号；
-- 创建 collection_target、article、collection_runs 索引；
-- 建立标准化 URL 唯一约束。
+- 创建 `collection_target`、`article`、`article_interaction_history`、`collection_runs`、`daily_report` 5 张表；
+- 设置字符集为 `utf8mb4`、排序规则为 `utf8mb4_unicode_ci`；
+- 建立 `uniq_article_url_normalized`、`idx_article_publish_time` 等核心索引。
 
-如果已经用旧配置创建过数据卷，后来才修改密码或初始化脚本，重启容器不会重新执行初始化。此时应使用现有密码迁移，或者先备份，再明确删除旧卷并重新初始化。
-
-## 常见问题
-
-### 端口被占用
-
-编辑 .env.mongo：
-
-    MONGO_PORT=27020
-
-然后重新启动。
-
-### 容器 unhealthy
-
-    .\mongodb.bat logs
-
-重点检查 root 密码、初始化脚本和数据卷是否来自另一套旧配置。
-
-### 如何查看连接串
-
-    .\mongodb.bat connection
-
-连接串中包含应用密码，不要把输出粘贴到 Issue、日志或截图中。
+若需查看历史 MongoDB 容器以做数据迁移回溯，`compose.yaml` 中保留了 `mongodb` 服务定义，仍可通过 `.\mongodb.bat` 按需拉起。

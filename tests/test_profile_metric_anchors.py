@@ -78,6 +78,23 @@ class ProfileMetricAnchorTests(unittest.TestCase):
         self.assertEqual(feed["articles"][0]["list_read_count"], 5424)
         self.assertEqual(feed["articles"][0]["list_like_count"], 77)
 
+    def test_navigation_tab_is_not_a_sticker_section(self) -> None:
+        screenshot = Image.new("RGB", (1000, 1000), "white")
+        rows = [
+            row("全部", 80, 340, 130, 370),
+            row("贴图", 160, 340, 220, 370),
+            row("文章", 250, 340, 310, 370),
+            row("视频号", 340, 340, 420, 370),
+            row("置顶", 80, 430, 130, 460),
+            row("昨天", 80, 700, 140, 730),
+            row("贴图", 80, 860, 140, 890),
+        ]
+        detector = WeChatProfileOCR()
+        with patch.object(detector, "_rows", return_value=rows):
+            feed = detector.inspect_profile_feed(screenshot)
+
+        self.assertEqual([item["text"] for item in feed["time_labels"]], ["置顶", "昨天", "贴图"])
+
 
 if __name__ == "__main__":
     unittest.main()
